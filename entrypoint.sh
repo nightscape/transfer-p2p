@@ -21,8 +21,9 @@ Usage:
   docker run transfer-p2p <METHOD> client <ID> [ARGS...]   - Connect via Malai bridge
 
 Transfer Methods:
-  rsync    File synchronization with delta transfers
-  tcp      Generic TCP port tunneling (expose any TCP service via P2P)
+  rsync     File synchronization with delta transfers
+  tcp       Generic TCP port tunneling (expose any TCP service via P2P)
+  weaviate  Weaviate database replication via P2P
 
 tcp Mode:
   server <PORT> [--quiet]  Expose a TCP port via Malai P2P tunnel
@@ -42,6 +43,15 @@ rsync Mode:
                           ID: Malai identifier from server
                           SRC: Source path
                           DEST: Destination path
+
+weaviate Mode:
+  server <URL> [--quiet]   Expose Weaviate via Malai P2P tunnel
+                          URL: http://[api-key:KEY@]host:port
+                          --quiet outputs only MALAI_ID=<id> for machine parsing
+
+  client <ID> <URL>        Connect to source via P2P and copy to target
+                          ID: Malai identifier from server
+                          URL: http://[api-key:KEY@]host:port (target Weaviate)
 
 Examples:
   # On server (human-friendly):

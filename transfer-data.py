@@ -81,6 +81,9 @@ from urllib.parse import urlparse, parse_qs
 from dataclasses import dataclass
 from typing import Optional, List
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -92,6 +95,7 @@ class Location:
     username: Optional[str]
     password: Optional[str]
     port: Optional[int]
+    service_name: Optional[str] = None  # For weaviate/postgres: actual service/container name
 
     @classmethod
     def parse(cls, url: str, default_host: Optional[str] = None) -> 'Location':
@@ -166,32 +170,40 @@ class Location:
             )
 
         elif parsed.scheme == 'weaviate':
-            # weaviate://[api-key:KEY@]host[:port]
+            # weaviate://[api-key:KEY@]service-or-container-name[:port]
+            # The hostname is the service/container name (e.g., weaviate-0, ai-platform-weaviate-1)
+            # The execution context (k8s:orbstack or root@host) comes from default_host
             port = parsed.port
             if port is None:
                 # Default port is 80 for http, 443 for https
                 port = 80
             return cls(
                 scheme='weaviate',
-                host=parsed.hostname,
+                host=default_host,  # Execution context (k8s:context or ssh-host)
                 path=parsed.path or '/',
                 username=parsed.username,
                 password=parsed.password,
-                port=port
+                port=port,
+                service_name=parsed.hostname  # Actual service/container name
             )
 
         elif parsed.scheme == 'postgres':
-            # postgres://user:pass@container-or-pod/database
-            # hostname is the container/pod name
-            # path is the database name
+            # postgres://user:pass@service-name[.namespace]/database
+            # The hostname can be:
+            #   - pod-name (uses default namespace)
+            #   - pod-name.namespace (explicit namespace, K8s DNS style)
+            #   - pod-name.namespace.svc.cluster.local (full K8s DNS)
+            # The execution context (k8s:orbstack or root@host) comes from default_host
+            # We store the service/pod name in service_name and the execution context in host
             database = parsed.path.lstrip('/')
             return cls(
                 scheme='postgres',
-                host=parsed.hostname,  # container or pod name
+                host=default_host,  # Execution context (k8s:context or ssh-host)
                 path=database,
                 username=parsed.username,
                 password=parsed.password,
-                port=parsed.port or 5432
+                port=parsed.port or 5432,
+                service_name=parsed.hostname  # service-name[.namespace[.svc.cluster.local]]
             )
 
         else:
@@ -201,11 +213,84 @@ class Location:
 class TransferEngine:
     """Handles data transfers between different storage types."""
 
+    TRANSFER_P2P_IMAGE = "ghcr.io/nightscape/transfer-p2p:main"
+
     def __init__(self, from_host: str, to_host: str, dry_run: bool = False, debug: bool = False):
         self.from_host = from_host
         self.to_host = to_host
         self.dry_run = dry_run
         self.debug = debug
+
+        # Pull latest transfer-p2p image
+        self._pull_transfer_image()
+
+    def _build_docker_run_cmd(
+        self,
+        name: str,
+        command_args: list,
+        detach: bool = False,
+        rm: bool = False,
+        network: str = None,
+        volumes: list = None,
+        env_vars: dict = None,
+        entrypoint: str = None,
+        extra_args: list = None
+    ) -> list:
+        """Build a docker run command with support for extra args from environment.
+
+        Args:
+            name: Container name
+            command_args: Command and its arguments to run in container
+            detach: Run in detached mode (-d)
+            rm: Remove container after exit (--rm)
+            network: Network mode (e.g., 'host', 'container:name')
+            volumes: List of volume mounts (e.g., ['/host:/container'])
+            env_vars: Dictionary of environment variables
+            entrypoint: Override entrypoint
+            extra_args: Additional docker run arguments
+
+        Returns:
+            List of command parts suitable for subprocess
+        """
+        import os
+
+        cmd = ["docker", "run"]
+
+        if detach:
+            cmd.append("-d")
+        if rm:
+            cmd.append("--rm")
+
+        cmd.extend(["--name", name])
+
+        if network:
+            cmd.extend(["--network", network])
+
+        if volumes:
+            for vol in volumes:
+                cmd.extend(["-v", vol])
+
+        if env_vars:
+            for key, value in env_vars.items():
+                cmd.extend(["-e", f"{key}={value}"])
+
+        # Add extra args from environment variable
+        extra_docker_args = os.environ.get('TRANSFER_P2P_DOCKER_ARGS', '').strip()
+        if extra_docker_args:
+            import shlex
+            cmd.extend(shlex.split(extra_docker_args))
+
+        # Add any additional args passed directly
+        if extra_args:
+            cmd.extend(extra_args)
+
+        if entrypoint:
+            cmd.extend(["--entrypoint", entrypoint])
+
+        cmd.append(self.TRANSFER_P2P_IMAGE)
+        cmd.extend(command_args)
+
+        return cmd
 
     def is_localhost(self, host: str) -> bool:
         """Check if host is localhost."""
@@ -276,18 +361,41 @@ class TransferEngine:
 
         return result
 
+    def _pull_transfer_image(self):
+        """Pull latest transfer-p2p image."""
+        if self.dry_run:
+            print(f"[DRY RUN] Would pull Docker image: {self.TRANSFER_P2P_IMAGE}")
+            return
+
+        print(f"🐳 Pulling latest {self.TRANSFER_P2P_IMAGE}...")
+        try:
+            result = subprocess.run(
+                ["docker", "pull", self.TRANSFER_P2P_IMAGE],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if result.returncode != 0:
+                print(f"  ⚠️  Warning: Failed to pull image, will use cached version")
+                if self.debug:
+                    print(f"[DEBUG] Pull error: {result.stderr}")
+            else:
+                print(f"  ✅ Image pulled successfully")
+        except Exception as e:
+            print(f"  ⚠️  Warning: Failed to pull image ({e}), will use cached version")
+
     def _start_tcp_tunnel(self, location: Location, unique_id: str) -> dict:
         """Start TCP tunnel for exposing a service via Malai P2P.
 
         Returns dict with cleanup info and 'malai_id' for P2P connection.
         """
-        rsync_p2p_image = "ghcr.io/nightscape/rsync-p2p:main"
         port = location.port
+        service_name = location.service_name  # For weaviate: the actual service/container name
 
         if self.is_k8s_context(location.host):
-            # For K8s, we need to expose the service's port
+            # For K8s, use ephemeral debug container attached to the target pod
+            # This shares the network namespace - no socat needed!
             context = self.get_k8s_context(location.host)
-            pod_name = f"tcp-tunnel-{unique_id}"
 
             # Extract namespace if specified in host
             if '/' in location.host:
@@ -296,89 +404,143 @@ class TransferEngine:
             else:
                 namespace = 'default'
 
-            # Create pod that runs TCP tunnel
-            pod_spec = {
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "name": pod_name,
-                    "namespace": namespace
-                },
-                "spec": {
-                    "containers": [{
-                        "name": "tcp-tunnel",
-                        "image": rsync_p2p_image,
-                        "args": ["tcp", "server", str(port)],
-                        "env": [{"name": "QUIET", "value": "true"}]
-                    }],
-                    "restartPolicy": "Never"
-                }
-            }
+            if not service_name:
+                raise ValueError("service_name required for K8s weaviate tunneling")
 
-            print(f"  🚀 Starting TCP tunnel pod (Malai P2P) in K8s for port {port}...")
+            # Use the service_name as the target pod (e.g., weaviate-0)
+            target_pod = service_name
+            ephemeral_container_name = f"malai-{unique_id}"
 
-            import tempfile
-            import yaml
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
-                yaml.dump(pod_spec, f)
-                pod_file = f.name
+            # Get the actual container name in the pod (not the pod name!)
+            # Most StatefulSet pods have a single container with a different name
+            get_container_cmd = f"get pod {target_pod} -n {namespace} -o jsonpath='{{.spec.containers[0].name}}'"
+            container_result = self.execute_kubectl(context, get_container_cmd)
+            target_container = container_result.stdout.strip()
 
-            try:
-                apply_cmd = f"apply -f {pod_file}"
-                self.execute_kubectl(context, apply_cmd)
-            finally:
-                import os
-                os.unlink(pod_file)
+            if not target_container:
+                target_container = service_name  # Fallback to pod name
 
-            # Wait for pod to start and get Malai ID
-            print(f"  ⏳ Waiting for TCP tunnel to initialize...")
-            import time
-            time.sleep(5)
+            print(f"  🚀 Attaching ephemeral tunnel container to pod {target_pod} (container: {target_container})...")
+            if self.debug:
+                print(f"[DEBUG] Using ephemeral container: {ephemeral_container_name}")
+                print(f"[DEBUG] Target container: {target_container}")
+                print(f"[DEBUG] Shares network namespace, so localhost:{port} = {service_name}:{port}")
 
-            logs_cmd = f"logs {pod_name} -n {namespace}"
-            result = self.execute_kubectl(context, logs_cmd)
-
-            malai_id = None
-            for line in result.stdout.splitlines():
-                if line.startswith('MALAI_ID='):
-                    malai_id = line.split('=', 1)[1].strip()
-                    break
-
-            if not malai_id:
-                raise Exception(f"Failed to get Malai ID from TCP tunnel pod. Logs: {result.stdout}")
+            debug_cmd = (
+                f"debug {target_pod} -n {namespace} "
+                f"--profile=general "
+                f"--image={self.TRANSFER_P2P_IMAGE} "
+                f"--target={target_container} "
+                f"--container={ephemeral_container_name} "
+                f"--env=QUIET=true "
+                f"-- /usr/local/bin/entrypoint.sh tcp server {port}"
+            )
 
             if self.debug:
-                print(f"[DEBUG] Got Malai ID from K8s TCP tunnel: {malai_id}")
+                print(f"[DEBUG] Debug command: kubectl --context={context} {debug_cmd}")
+
+            # Run kubectl debug in background
+            import subprocess
+            full_cmd = f"kubectl --context={context} {debug_cmd}"
+
+            if self.dry_run:
+                print(f"[DRY RUN] Would execute: {full_cmd}")
+                return {
+                    'type': 'k8s-ephemeral-tunnel',
+                    'pod': target_pod,
+                    'container': ephemeral_container_name,
+                    'namespace': namespace,
+                    'context': context,
+                    'malai_id': 'dry-run-id',
+                    'port': port
+                }
+
+            # Start ephemeral container
+            proc = subprocess.Popen(
+                full_cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            # Wait for malai to initialize and output MALAI_ID
+            # The tcp server with QUIET=true outputs: MALAI_ID=<id> and PORT=<port>
+            print(f"  ⏳ Waiting for Malai P2P tunnel to initialize (30-60s)...")
+            import time
+            time.sleep(10)  # Give ephemeral container time to start
+
+            # Get logs from ephemeral container
+            max_attempts = 12  # 60 seconds total
+            malai_id = None
+
+            for attempt in range(max_attempts):
+                time.sleep(5)
+                logs_cmd = f"logs {target_pod} -n {namespace} -c {ephemeral_container_name}"
+                try:
+                    result = self.execute_kubectl(context, logs_cmd)
+
+                    for line in result.stdout.splitlines():
+                        if line.startswith('MALAI_ID='):
+                            malai_id = line.split('=', 1)[1].strip()
+                            break
+
+                    if malai_id:
+                        if self.debug:
+                            print(f"[DEBUG] Found Malai ID: {malai_id}")
+                        break
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] Attempt {attempt+1}/{max_attempts}: {e}")
+                    continue
+
+            if not malai_id:
+                # Get final logs for debugging
+                try:
+                    result = self.execute_kubectl(context, logs_cmd)
+                    raise Exception(f"Failed to get Malai ID from ephemeral container. Logs: {result.stdout}")
+                except:
+                    raise Exception(f"Failed to get Malai ID from ephemeral container after {max_attempts} attempts")
+
+            if self.debug:
+                print(f"[DEBUG] Got Malai ID from ephemeral container: {malai_id}")
 
             return {
-                'type': 'k8s-tcp-tunnel',
-                'name': pod_name,
+                'type': 'k8s-ephemeral-tunnel',
+                'pod': target_pod,
+                'container': ephemeral_container_name,
                 'namespace': namespace,
                 'context': context,
                 'malai_id': malai_id,
                 'port': port
             }
         else:
-            # For Docker/localhost, run TCP tunnel container
+            # For Docker, run TCP tunnel container connected to target container's network
             container_name = f"tcp-tunnel-{unique_id}"
 
-            # Network mode: if host is localhost, use host network; otherwise connect to host network
-            if self.is_localhost(location.host):
+            # If service_name is provided (Weaviate container), connect to its network
+            if service_name:
+                # Connect to the target container's network so we can access it as localhost
+                network_mode = f"--network container:{service_name}"
+                target_host = "localhost"
+            elif self.is_localhost(location.host):
                 network_mode = "--network host"
+                target_host = "localhost"
             else:
-                # For remote hosts, we assume the service is accessible on the host
+                # For remote hosts, use host network
                 network_mode = "--network host"
+                target_host = "localhost"
 
             start_cmd = (
                 f"docker run -d --name {container_name} "
                 f"{network_mode} "
                 f"-e QUIET=true "
-                f"{rsync_p2p_image} tcp server {port}"
+                f"{self.TRANSFER_P2P_IMAGE} tcp server {port}"
             )
 
-            print(f"  🚀 Starting TCP tunnel (Malai P2P) on {location.host} for port {port}...")
+            print(f"  🚀 Starting TCP tunnel (Malai P2P) on {location.host} for {service_name or 'localhost'}:{port}...")
             if self.debug:
                 print(f"[DEBUG] Start command: {start_cmd}")
+                print(f"[DEBUG] Network mode: {network_mode}")
 
             self.execute_on_host(location.host, start_cmd)
 
@@ -422,6 +584,15 @@ class TransferEngine:
                 if self.debug:
                     print(f"[DEBUG] Failed to cleanup tunnel container: {e}")
 
+        elif tunnel_info['type'] == 'k8s-ephemeral-tunnel':
+            # Ephemeral containers can't be removed directly, but we should note this
+            # They will be cleaned up when the pod is deleted
+            if self.debug:
+                print(f"[DEBUG] Ephemeral container {tunnel_info['container']} will persist in pod {tunnel_info['pod']} until pod deletion")
+            # Note: We could optionally delete the entire pod if we created it, but for
+            # existing pods (like weaviate-0), we leave the ephemeral container metadata
+            print(f"  ℹ️  Ephemeral container will remain in pod metadata (terminated state)")
+
         elif tunnel_info['type'] == 'k8s-tcp-tunnel':
             delete_cmd = f"delete pod {tunnel_info['name']} -n {tunnel_info['namespace']} --force --grace-period=0"
             try:
@@ -436,183 +607,183 @@ class TransferEngine:
         target: Location,
         exclude: Optional[List[str]] = None
     ):
-        """Transfer data between Weaviate instances using P2P tunnel and REST API."""
-        print(f"🔄 Transferring Weaviate → Weaviate (P2P): {source.host}:{source.port} → {target.host}:{target.port}")
+        """Transfer data between Weaviate instances using P2P tunnel without localhost.
+
+        Architecture:
+        1. Source: Start TCP tunnel exposing source Weaviate via Malai P2P
+        2. Target: Run copy container that:
+           - Connects to source via Malai bridge (localhost:8080 → source P2P)
+           - Connects to target Weaviate via container network (localhost:8081 → target)
+           - Runs Python script to copy data between the two
+
+        All data flows directly between source and target hosts via P2P, never through localhost.
+        """
+        print(f"🔄 Transferring Weaviate → Weaviate (P2P): {source.service_name} → {target.service_name}")
 
         if self.debug:
-            print(f"[DEBUG] Source location: host={source.host}, port={source.port}, has_auth={bool(source.password)}")
-            print(f"[DEBUG] Target location: host={target.host}, port={target.port}, has_auth={bool(target.password)}")
+            print(f"[DEBUG] Source: host={source.host}, service={source.service_name}, port={source.port}, has_auth={bool(source.password)}")
+            print(f"[DEBUG] Target: host={target.host}, service={target.service_name}, port={target.port}, has_auth={bool(target.password)}")
 
-        import requests
-        import urllib3
         import subprocess
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        import time
 
-        # Generate unique ID for this transfer
-        unique_id = subprocess.run(['date', '+%s%N'], capture_output=True, text=True).stdout.strip()[:16]
+        # Generate unique IDs for this transfer
+        source_unique_id = subprocess.run(['date', '+%s%N'], capture_output=True, text=True).stdout.strip()[:16]
+        time.sleep(0.1)
+        copy_unique_id = subprocess.run(['date', '+%s%N'], capture_output=True, text=True).stdout.strip()[:16]
 
         source_tunnel = None
-        bridge_process = None
+        copy_container_name = f"weaviate-copy-{copy_unique_id}"
 
         try:
             # Start TCP tunnel on source to expose Weaviate port via Malai P2P
-            source_tunnel = self._start_tcp_tunnel(source, unique_id)
-            malai_id = source_tunnel['malai_id']
-            print(f"  📡 Malai P2P ID: {malai_id}")
+            source_tunnel = self._start_tcp_tunnel(source, source_unique_id)
+            source_malai_id = source_tunnel['malai_id']
+            print(f"  📡 Source Malai P2P ID: {source_malai_id}")
 
-            # Start Malai bridge on target side (or localhost) to connect to source
-            bridge_port = 18080  # Use a different port to avoid conflicts
-            print(f"  🔌 Setting up Malai TCP bridge on port {bridge_port}...")
+            # Build copy command arguments
+            # Source will be accessed via Malai bridge on port 18080
+            # Target will be accessed via container network namespace on its actual port
+            source_bridge_port = 18080
+            target_local_port = target.port
+            source_actual_port = source.port
 
-            # Run malai tcp-bridge locally (assuming transfer-data.py runs on target host)
-            # We need the malai binary available locally
-            bridge_cmd = f"malai tcp-bridge {malai_id} {bridge_port}"
+            copy_args = [
+                "--source-url", f"http://localhost:{source_bridge_port}",
+                "--target-url", f"http://localhost:{target_local_port}",
+            ]
 
-            if self.debug:
-                print(f"[DEBUG] Bridge command: {bridge_cmd}")
-
-            # Start bridge in background
-            bridge_process = subprocess.Popen(
-                bridge_cmd.split(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-
-            # Give bridge time to establish
-            import time
-            time.sleep(5)
-
-            if bridge_process.poll() is not None:
-                stdout, stderr = bridge_process.communicate()
-                raise Exception(f"Malai bridge failed to start: {stderr.decode()}")
-
-            print(f"  ✅ Bridge established on localhost:{bridge_port}")
-
-            # Now connect to source via bridge and target directly
-            source_url = f"http://localhost:{bridge_port}"
-
-            # Build target URL
-            if target.port == 443:
-                target_url = f"https://{target.host}"
-            elif target.port == 80:
-                target_url = f"http://{target.host}"
-            else:
-                target_url = f"http://{target.host}:{target.port}"
-
-            if self.debug:
-                print(f"[DEBUG] Source URL (via bridge): {source_url}")
-                print(f"[DEBUG] Target URL: {target_url}")
-
-            source_headers = {}
-            target_headers = {}
-
-            if source.password:  # api-key stored in password field
-                source_headers['Authorization'] = f'Bearer {source.password}'
+            if source.password:
+                copy_args.extend(["--source-auth", source.password])
             if target.password:
-                target_headers['Authorization'] = f'Bearer {target.password}'
+                copy_args.extend(["--target-auth", target.password])
+            if exclude:
+                copy_args.extend(["--exclude", ','.join(exclude)])
 
-            # Get source schema
-            print("  📊 Fetching source schema...")
-            schema_resp = requests.get(f"{source_url}/v1/schema", headers=source_headers, verify=False)
-            schema_resp.raise_for_status()
-            schema = schema_resp.json()
+            # Run copy container on target host
+            # Container will:
+            # 1. Run malai bridge to connect to source (localhost:8080 → source P2P)
+            # 2. Connect to target weaviate via shared network namespace (localhost:target_port → target weaviate)
+            # 3. Run copy_weaviate.py to transfer data
+            print(f"  🚀 Starting copy container on {target.host}...")
 
-            if not schema.get('classes'):
-                print("  ⚠️  Source schema is empty, nothing to transfer")
-                return
+            # Use entrypoint wrapper script that starts bridge then runs copy
+            # Important: Bridge listens on source_bridge_port (18080) locally
+            #            and connects to the source via P2P
+            copy_script = f"""#!/bin/bash
+set -e
 
-            # Create classes in target
-            print(f"  🔨 Creating {len(schema['classes'])} classes in target...")
-            for cls in schema['classes']:
-                if self.dry_run:
-                    print(f"  [DRY RUN] Would create class: {cls['class']}")
-                    continue
+# Start Malai bridge in background
+# Bridge will listen on localhost:{source_bridge_port} and forward to source via P2P
+malai tcp-bridge {source_malai_id} {source_bridge_port} > /tmp/bridge.log 2>&1 &
+BRIDGE_PID=$!
 
-                resp = requests.post(f"{target_url}/v1/schema", headers=target_headers, json=cls, verify=False)
-                if resp.status_code == 422 and 'already exists' in resp.text:
-                    print(f"  ℹ️  Class {cls['class']} already exists, skipping")
+sleep 5
+
+# Check if bridge is running and listening
+echo "=== Checking bridge status ===" >&2
+if kill -0 $BRIDGE_PID 2>/dev/null; then
+    echo "Bridge process is running (PID: $BRIDGE_PID)" >&2
+else
+    echo "Bridge process is NOT running!" >&2
+fi
+netstat -ln | grep 18080 || echo "Port 18080 is NOT listening" >&2
+echo "=============================" >&2
+
+# Output bridge log before running copy
+echo "=== Bridge log (before copy) ===" >&2
+cat /tmp/bridge.log 2>&1 || echo "No bridge log found" >&2
+echo "================================" >&2
+
+# Run copy script
+python3 /usr/local/bin/copy_weaviate.py {' '.join(copy_args)}
+COPY_EXIT=$?
+
+# Cleanup
+kill $BRIDGE_PID 2>/dev/null || true
+
+exit $COPY_EXIT
+"""
+
+            if target.host.startswith('root@') or '@' in target.host:
+                # Remote Docker host - run via SSH
+                # Use --entrypoint to bypass the custom entrypoint and run bash directly
+                # If target service is localhost, use host network instead of container network
+                if target.service_name in ('localhost', '127.0.0.1', '::1'):
+                    network_mode = "--network host"
                 else:
-                    resp.raise_for_status()
+                    network_mode = f"--network container:{target.service_name}"
 
-            # Transfer objects for each class
-            for cls in schema['classes']:
-                class_name = cls['class']
+                copy_cmd = (
+                    f"docker run --rm --name {copy_container_name} "
+                    f"{network_mode} "
+                    f"--entrypoint bash "
+                    f"{self.TRANSFER_P2P_IMAGE} -c {subprocess.list2cmdline([copy_script])}"
+                )
 
-                # Skip if excluded
-                if exclude and any(re.match(pattern.replace('*', '.*'), class_name) for pattern in exclude):
-                    print(f"  🚫 Skipping excluded class: {class_name}")
-                    continue
+                if self.debug:
+                    print(f"[DEBUG] Copy command: ssh {target.host} {copy_cmd}")
 
-                print(f"  📦 Transferring class: {class_name}")
+                # Execute without check=True so we can see the error
+                result = subprocess.run(
+                    ['ssh', target.host, copy_cmd],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
 
-                # Batch export/import
-                offset = 0
-                limit = 100
-                total = 0
+                # Always show stdout/stderr for debugging
+                if result.stdout:
+                    print(f"Copy container output:\n{result.stdout}")
+                if result.stderr:
+                    print(f"Copy container stderr:\n{result.stderr}")
 
-                while True:
-                    # Fetch batch (include vectors!)
-                    resp = requests.get(
-                        f"{source_url}/v1/objects",
-                        headers=source_headers,
-                        params={'class': class_name, 'limit': limit, 'offset': offset, 'include': 'vector'},
-                        verify=False
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
+                if result.returncode != 0:
+                    raise Exception(f"Copy container failed with exit code {result.returncode}")
 
-                    objects = data.get('objects', [])
-                    if not objects:
-                        break
+            elif self.is_k8s_context(target.host):
+                # K8s context - not yet supported for target (only source)
+                raise NotImplementedError("K8s as target for Weaviate copying not yet implemented")
 
-                    # Import batch
-                    if not self.dry_run:
-                        batch_objects = []
-                        for obj in objects:
-                            batch_obj = {
-                                'class': class_name,
-                                'id': obj.get('id'),
-                                'properties': obj.get('properties', {}),
-                            }
-                            if 'vector' in obj:
-                                batch_obj['vector'] = obj['vector']
-                            batch_objects.append(batch_obj)
+            else:
+                # Local Docker
+                # If target service is localhost, use host network instead of container network
+                if target.service_name in ('localhost', '127.0.0.1', '::1'):
+                    network_args = ["--network", "host"]
+                else:
+                    network_args = ["--network", f"container:{target.service_name}"]
 
-                        batch_resp = requests.post(
-                            f"{target_url}/v1/batch/objects",
-                            headers=target_headers,
-                            json={'objects': batch_objects},
-                            verify=False
-                        )
-                        batch_resp.raise_for_status()
+                copy_cmd = [
+                    "docker", "run", "--rm", "--name", copy_container_name,
+                ] + network_args + [
+                    "--entrypoint", "bash",
+                    self.TRANSFER_P2P_IMAGE,
+                    "-c", copy_script
+                ]
 
-                        # Check for errors in batch response
-                        batch_result = batch_resp.json()
-                        if isinstance(batch_result, list):
-                            errors = [r for r in batch_result if r.get('result', {}).get('errors')]
-                            if errors:
-                                print(f"\n  ⚠️  Batch had {len(errors)} errors")
-                                for err in errors[:3]:  # Show first 3 errors
-                                    print(f"    {err.get('result', {}).get('errors', {}).get('error', [{}])[0].get('message', 'Unknown error')}")
+                if self.debug:
+                    print(f"[DEBUG] Copy command: {' '.join(copy_cmd)}")
 
-                    total += len(objects)
-                    offset += limit
-                    print(f"    → Transferred {total} objects...", end='\r')
+                result = subprocess.run(
+                    copy_cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
 
-                print(f"    ✅ Transferred {total} objects for {class_name}")
+                # Always show stdout/stderr for debugging
+                if result.stdout:
+                    print(f"Copy container output:\n{result.stdout}")
+                if result.stderr:
+                    print(f"Copy container stderr:\n{result.stderr}")
+
+                if result.returncode != 0:
+                    raise Exception(f"Copy container failed with exit code {result.returncode}")
 
             print("  ✅ Weaviate → Weaviate transfer completed successfully")
 
         finally:
-            # Cleanup resources
-            if bridge_process and bridge_process.poll() is None:
-                print("  🧹 Stopping Malai bridge...")
-                bridge_process.terminate()
-                try:
-                    bridge_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    bridge_process.kill()
-
+            # Cleanup source tunnel
             if source_tunnel:
                 self._cleanup_tcp_tunnel(source_tunnel)
 
@@ -622,9 +793,6 @@ class TransferEngine:
         Returns dict with cleanup info and 'malai_id' for P2P connection.
         """
         daemon_port = 873
-
-        # Use rsync-p2p image which combines rsync + Malai for P2P NAT traversal
-        rsync_p2p_image = "ghcr.io/nightscape/rsync-p2p:main"
 
         if location.scheme == 'docker-volume':
             # Parse volume name and subpath
@@ -642,7 +810,7 @@ class TransferEngine:
                 f"docker run -d --name {container_name} "
                 f"{volume_mount} "
                 f"-e QUIET=true "
-                f"{rsync_p2p_image} server"
+                f"{self.TRANSFER_P2P_IMAGE} rsync server"
             )
 
             print(f"  🚀 Starting rsync-p2p daemon (Malai P2P) on {location.host}...")
@@ -701,8 +869,8 @@ class TransferEngine:
                 "spec": {
                     "containers": [{
                         "name": "rsync-p2p-server",
-                        "image": rsync_p2p_image,
-                        "args": ["server"],
+                        "image": self.TRANSFER_P2P_IMAGE,
+                        "args": ["rsync", "server"],
                         "env": [{"name": "QUIET", "value": "true"}],
                         "volumeMounts": [{
                             "name": "data",
@@ -775,7 +943,7 @@ class TransferEngine:
                 f"docker run -d --name {container_name} "
                 f"-v {location.path}:/data:ro "
                 f"-e QUIET=true "
-                f"{rsync_p2p_image} server"
+                f"{self.TRANSFER_P2P_IMAGE} rsync server"
             )
 
             print(f"  🚀 Starting rsync-p2p daemon (Malai P2P) on {location.host}...")
@@ -837,10 +1005,6 @@ class TransferEngine:
         Args:
             malai_connection: Dict with 'malai_id' and 'subpath' from daemon
         """
-
-        # Use rsync-p2p image for P2P client
-        rsync_p2p_image = "ghcr.io/nightscape/rsync-p2p:main"
-
         malai_id = malai_connection['malai_id']
         source_subpath = malai_connection.get('subpath', '')
 
@@ -858,23 +1022,62 @@ class TransferEngine:
             container_name = f"rsync-client-{unique_id}"
 
             # rsync-p2p client command: client <malai_id> /source/ /dest/
-            # Source path: daemon exposes its /data as root, so we use "/{source_subpath}"
+            # Source path: relative to rsync module root (module 'data' points to /data in daemon)
+            # So subpath should be the path relative to /data, e.g., "/" for root, "/storage/" for subdir
             # Dest path: /data{target_subpath}/ in client container
-            source_path = f"/{source_subpath.lstrip('/')}/" if source_subpath else "/"
+            source_path = f"{source_subpath}/" if source_subpath else "/"
             dest_path = f"/data{target_subpath}/"
 
             client_cmd = (
-                f"docker run --rm --name {container_name} "
+                f"docker run --name {container_name} "
                 f"-v {volume}:/data "
-                f"{rsync_p2p_image} client {malai_id} {source_path} {dest_path}"
+                f"{self.TRANSFER_P2P_IMAGE} rsync client {malai_id} {source_path} {dest_path}"
             )
 
             print(f"  🔄 Running rsync-p2p client (Malai P2P) on {target.host}...")
             if self.debug:
                 print(f"[DEBUG] Malai ID: {malai_id}")
+                print(f"[DEBUG] Source subpath: {source_subpath}")
+                print(f"[DEBUG] Source path: {source_path}")
+                print(f"[DEBUG] Dest path: {dest_path}")
                 print(f"[DEBUG] Client command: {client_cmd}")
 
-            self.execute_on_host(target.host, client_cmd)
+            try:
+                result = self.execute_on_host(target.host, client_cmd)
+
+                # Show logs in debug mode on success
+                if self.debug:
+                    logs_cmd = f"docker logs {container_name}"
+                    try:
+                        logs_result = self.execute_on_host(target.host, logs_cmd)
+                        print(f"[DEBUG] Rsync-p2p client output:\n{logs_result.stdout}")
+                        if logs_result.stderr:
+                            print(f"[DEBUG] Rsync-p2p client errors:\n{logs_result.stderr}")
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[DEBUG] Failed to get client logs: {e}")
+            except subprocess.CalledProcessError as e:
+                # On failure, try to get logs before cleanup
+                if self.debug:
+                    print(f"[DEBUG] Client command failed with exit code {e.returncode}")
+                    logs_cmd = f"docker logs {container_name}"
+                    try:
+                        logs_result = self.execute_on_host(target.host, logs_cmd)
+                        print(f"[DEBUG] Rsync-p2p client output:\n{logs_result.stdout}")
+                        if logs_result.stderr:
+                            print(f"[DEBUG] Rsync-p2p client errors:\n{logs_result.stderr}")
+                    except Exception as log_err:
+                        print(f"[DEBUG] Failed to get client logs: {log_err}")
+                # Re-raise the original error after showing logs
+                raise
+            finally:
+                # Always cleanup container
+                cleanup_cmd = f"docker rm -f {container_name}"
+                try:
+                    self.execute_on_host(target.host, cleanup_cmd)
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] Failed to cleanup container: {e}")
 
         elif target.scheme == 'k8s-pvc':
             # Parse namespace, PVC, subpath
@@ -886,8 +1089,8 @@ class TransferEngine:
             pod_name = f"rsync-client-{unique_id}"
             context = self.get_k8s_context(target.host)
 
-            # Source path: daemon exposes /data as root
-            source_path = f"/{source_subpath.lstrip('/')}/" if source_subpath else "/"
+            # Source path: relative to rsync module root (module 'data' points to /data in daemon)
+            source_path = f"{source_subpath}/" if source_subpath else "/"
             dest_path = f"/data{target_subpath}/"
 
             # Create client pod with rsync-p2p
@@ -901,8 +1104,8 @@ class TransferEngine:
                 "spec": {
                     "containers": [{
                         "name": "rsync-p2p-client",
-                        "image": rsync_p2p_image,
-                        "args": ["client", malai_id, source_path, dest_path],
+                        "image": self.TRANSFER_P2P_IMAGE,
+                        "args": ["rsync", "client", malai_id, source_path, dest_path],
                         "volumeMounts": [{
                             "name": "data",
                             "mountPath": "/data"
@@ -961,22 +1164,60 @@ class TransferEngine:
         elif target.scheme == 'directory':
             container_name = f"rsync-client-{unique_id}"
 
-            # Source path: daemon exposes /data as root
-            source_path = f"/{source_subpath.lstrip('/')}/" if source_subpath else "/"
+            # Source path: relative to rsync module root (module 'data' points to /data in daemon)
+            source_path = f"{source_subpath}/" if source_subpath else "/"
             dest_path = "/data/"
 
             client_cmd = (
-                f"docker run --rm --name {container_name} "
+                f"docker run --name {container_name} "
                 f"-v {target.path}:/data "
-                f"{rsync_p2p_image} client {malai_id} {source_path} {dest_path}"
+                f"{self.TRANSFER_P2P_IMAGE} rsync client {malai_id} {source_path} {dest_path}"
             )
 
             print(f"  🔄 Running rsync-p2p client (Malai P2P) on {target.host}...")
             if self.debug:
                 print(f"[DEBUG] Malai ID: {malai_id}")
+                print(f"[DEBUG] Source subpath: {source_subpath}")
+                print(f"[DEBUG] Source path: {source_path}")
+                print(f"[DEBUG] Dest path: {dest_path}")
                 print(f"[DEBUG] Client command: {client_cmd}")
 
-            self.execute_on_host(target.host, client_cmd)
+            try:
+                result = self.execute_on_host(target.host, client_cmd)
+
+                # Show logs in debug mode on success
+                if self.debug:
+                    logs_cmd = f"docker logs {container_name}"
+                    try:
+                        logs_result = self.execute_on_host(target.host, logs_cmd)
+                        print(f"[DEBUG] Rsync-p2p client output:\n{logs_result.stdout}")
+                        if logs_result.stderr:
+                            print(f"[DEBUG] Rsync-p2p client errors:\n{logs_result.stderr}")
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[DEBUG] Failed to get client logs: {e}")
+            except subprocess.CalledProcessError as e:
+                # On failure, try to get logs before cleanup
+                if self.debug:
+                    print(f"[DEBUG] Client command failed with exit code {e.returncode}")
+                    logs_cmd = f"docker logs {container_name}"
+                    try:
+                        logs_result = self.execute_on_host(target.host, logs_cmd)
+                        print(f"[DEBUG] Rsync-p2p client output:\n{logs_result.stdout}")
+                        if logs_result.stderr:
+                            print(f"[DEBUG] Rsync-p2p client errors:\n{logs_result.stderr}")
+                    except Exception as log_err:
+                        print(f"[DEBUG] Failed to get client logs: {log_err}")
+                # Re-raise the original error after showing logs
+                raise
+            finally:
+                # Always cleanup container
+                cleanup_cmd = f"docker rm -f {container_name}"
+                try:
+                    self.execute_on_host(target.host, cleanup_cmd)
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] Failed to cleanup container: {e}")
         else:
             raise ValueError(f"Unsupported scheme for rsync client: {target.scheme}")
 
@@ -1092,11 +1333,17 @@ class TransferEngine:
 
         if self.is_k8s_context(source.host):
             context = self.get_k8s_context(source.host)
-            if '/' in source.host:
-                namespace, pod = source.host.split('/', 1)
+
+            # For postgres, service_name can be:
+            #   - pod-name (default namespace)
+            #   - pod-name.namespace (explicit namespace)
+            #   - pod-name.namespace.svc.cluster.local (full DNS)
+            service_parts = source.service_name.split('.')
+            pod = service_parts[0]
+            if len(service_parts) >= 2 and service_parts[1] not in ('svc', 'cluster', 'local'):
+                namespace = service_parts[1]
             else:
                 namespace = 'default'
-                pod = source.host
 
             pvc_namespace, pvc_name = volume_identifier.split('/', 1)
             pod_name = f"pg-dump-{unique_id}"
@@ -1111,7 +1358,7 @@ class TransferEngine:
                 "spec": {
                     "containers": [{
                         "name": "pg-dump",
-                        "image": "postgres:16-alpine",
+                        "image": "postgres:alpine",
                         "command": ["sh", "-c"],
                         "args": [f"pg_dump -h {pod}.{namespace}.svc.cluster.local -U {source.username} -Fc -f {dump_file} {source.path}"],
                         "env": [{"name": "PGPASSWORD", "value": source.password or ""}],
@@ -1148,13 +1395,14 @@ class TransferEngine:
             delete_cmd = f"delete pod {pod_name} -n {pvc_namespace} --force --grace-period=0"
             self.execute_kubectl(context, delete_cmd)
         else:
+            # For Docker: service_name contains the container name
             container_name = f"pg-dump-{unique_id}"
             dump_cmd = (
                 f"docker run --rm --name {container_name} "
-                f"--network container:{source.host} "
+                f"--network container:{source.service_name} "
                 f"-v {volume_identifier}:/dump "
                 f"-e PGPASSWORD={source.password or ''} "
-                f"postgres:16-alpine "
+                f"postgres:alpine "
                 f"pg_dump -h localhost -U {source.username} -Fc -f {dump_file} {source.path}"
             )
             self.execute_on_host(source.host, dump_cmd)
@@ -1169,11 +1417,17 @@ class TransferEngine:
 
         if self.is_k8s_context(target.host):
             context = self.get_k8s_context(target.host)
-            if '/' in target.host:
-                namespace, pod = target.host.split('/', 1)
+
+            # For postgres, service_name can be:
+            #   - pod-name (default namespace)
+            #   - pod-name.namespace (explicit namespace)
+            #   - pod-name.namespace.svc.cluster.local (full DNS)
+            service_parts = target.service_name.split('.')
+            pod = service_parts[0]
+            if len(service_parts) >= 2 and service_parts[1] not in ('svc', 'cluster', 'local'):
+                namespace = service_parts[1]
             else:
                 namespace = 'default'
-                pod = target.host
 
             pvc_namespace, pvc_name = volume_identifier.split('/', 1)
             pod_name = f"pg-restore-{unique_id}"
@@ -1188,9 +1442,9 @@ class TransferEngine:
                 "spec": {
                     "containers": [{
                         "name": "pg-restore",
-                        "image": "postgres:16-alpine",
+                        "image": "postgres:alpine",
                         "command": ["sh", "-c"],
-                        "args": [f"pg_restore -h {pod}.{namespace}.svc.cluster.local -U {target.username} -j4 --no-owner --clean -d {target.path} {dump_file}"],
+                        "args": [f"pg_restore -h {pod}.{namespace}.svc.cluster.local -U {target.username} -j4 --no-owner --clean -d {target.path} {dump_file} 2>&1 | grep -v 'transaction_timeout' || true"],
                         "env": [{"name": "PGPASSWORD", "value": target.password or ""}],
                         "volumeMounts": [{
                             "name": "dump",
@@ -1230,14 +1484,15 @@ class TransferEngine:
             delete_cmd = f"delete pod {pod_name} -n {pvc_namespace} --force --grace-period=0"
             self.execute_kubectl(context, delete_cmd)
         else:
+            # For Docker: service_name contains the container name
             container_name = f"pg-restore-{unique_id}"
             restore_cmd = (
                 f"docker run --rm --name {container_name} "
-                f"--network container:{target.host} "
+                f"--network container:{target.service_name} "
                 f"-v {volume_identifier}:/dump "
                 f"-e PGPASSWORD={target.password or ''} "
-                f"postgres:16-alpine "
-                f"pg_restore -h localhost -U {target.username} -j4 --no-owner --clean -d {target.path} {dump_file}"
+                f"postgres:alpine "
+                f"sh -c \"pg_restore -h localhost -U {target.username} -j4 --no-owner --clean -d {target.path} {dump_file} 2>&1 | grep -v 'transaction_timeout' || true\""
             )
             self.execute_on_host(target.host, restore_cmd)
 
@@ -1301,17 +1556,25 @@ class TransferEngine:
         - Resume capability if transfer interrupted
         - Works across isolated networks
         """
-        print(f"🔄 Transferring Postgres via rsync-p2p: {source.host}/{source.path} → {target.host}/{target.path}")
+        logger.debug("transfer_postgres_to_postgres() started")
+        print(f"🔄 Transferring Postgres via rsync-p2p: {source.host}/{source.path} → {target.host}/{target.path}", flush=True)
 
+        logger.debug("Generating unique_id")
         unique_id = subprocess.run(['date', '+%s%N'], capture_output=True, text=True).stdout.strip()[:16]
+        logger.debug(f"unique_id={unique_id}")
 
         source_volume = None
         target_volume = None
         daemon_info = None
 
         try:
+            logger.debug("Creating temp volume for source")
             source_volume = self._create_temp_volume(source, unique_id)
+            logger.debug(f"Source volume created: {source_volume}")
+
+            logger.debug("Running pg_dump")
             self._pg_dump_to_volume(source, source_volume, unique_id)
+            logger.debug("pg_dump completed")
 
             target_volume = self._create_temp_volume(target, unique_id)
 
@@ -1400,14 +1663,23 @@ def main():
 
     args = parser.parse_args()
 
+    # Setup logging based on debug flag
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format='[%(levelname)s] %(message)s'
+    )
+
     if not args.copies:
         parser.error("At least one --copy argument is required")
 
     # Parse exclusions
+    logger.debug("Parsing exclusions")
     exclusions = args.exclude.split(',') if args.exclude else None
 
     # Create transfer engine
+    logger.debug("Creating TransferEngine")
     engine = TransferEngine(args.from_host, args.to_host, dry_run=args.dry_run, debug=args.debug)
+    logger.debug("TransferEngine created")
 
     print("🚀 Data Transfer Tool")
     print(f"📤 From: {args.from_host}")
@@ -1423,27 +1695,35 @@ def main():
         print()
 
     # Process each copy
+    logger.debug("Starting copy loop")
     for copy_spec in args.copies:
+        logger.debug(f"Processing copy_spec: {copy_spec}")
         if '->' not in copy_spec:
             print(f"❌ Error: Invalid copy spec (missing '->'): {copy_spec}")
             sys.exit(1)
 
         source_url, target_url = copy_spec.split('->', 1)
+        logger.debug(f"source_url={source_url}, target_url={target_url}")
 
-        if args.debug:
-            print(f"[DEBUG] Processing copy spec: {copy_spec}")
-            print(f"[DEBUG] Source URL: {source_url.strip()}")
-            print(f"[DEBUG] Target URL: {target_url.strip()}")
+        logger.info(f"Processing copy spec: {copy_spec}")
+        logger.info(f"Source URL: {source_url.strip()}")
+        logger.info(f"Target URL: {target_url.strip()}")
 
         try:
+            logger.debug("Parsing source location")
             source = Location.parse(source_url.strip(), args.from_host)
+            logger.debug(f"Source parsed: {source}")
+
+            logger.debug("Parsing target location")
             target = Location.parse(target_url.strip(), args.to_host)
+            logger.debug(f"Target parsed: {target}")
 
-            if args.debug:
-                print(f"[DEBUG] Parsed source Location: {source}")
-                print(f"[DEBUG] Parsed target Location: {target}")
+            logger.info(f"Parsed source Location: {source}")
+            logger.info(f"Parsed target Location: {target}")
 
+            logger.debug("Calling engine.transfer()")
             engine.transfer(source, target, exclusions)
+            logger.debug("Transfer completed")
             print()
 
         except Exception as e:
