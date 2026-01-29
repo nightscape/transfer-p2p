@@ -316,13 +316,13 @@ class TransferEngine:
             print(f"[DEBUG] Executing on {host}: {command}")
 
         if self.is_localhost(host):
-            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=True)
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
         else:
             result = subprocess.run(
                 ['ssh', host, command],
                 capture_output=True,
                 text=True,
-                check=True
+                check=False
             )
 
         if self.debug:
@@ -331,6 +331,16 @@ class TransferEngine:
                 print(f"[DEBUG] stdout: {result.stdout[:500]}")
             if result.stderr:
                 print(f"[DEBUG] stderr: {result.stderr[:500]}")
+
+        if result.returncode != 0:
+            print(f"  Command failed (exit {result.returncode}) on {host}: {command}")
+            if result.stdout:
+                print(f"  stdout: {result.stdout[:2000]}")
+            if result.stderr:
+                print(f"  stderr: {result.stderr[:2000]}")
+            raise subprocess.CalledProcessError(
+                result.returncode, result.args, result.stdout, result.stderr
+            )
 
         return result
 
@@ -349,7 +359,7 @@ class TransferEngine:
             shell=True,
             capture_output=True,
             text=True,
-            check=True
+            check=False
         )
 
         if self.debug:
@@ -358,6 +368,16 @@ class TransferEngine:
                 print(f"[DEBUG] stdout: {result.stdout[:500]}")
             if result.stderr:
                 print(f"[DEBUG] stderr: {result.stderr[:500]}")
+
+        if result.returncode != 0:
+            print(f"  kubectl failed (exit {result.returncode}): {full_command}")
+            if result.stdout:
+                print(f"  stdout: {result.stdout[:2000]}")
+            if result.stderr:
+                print(f"  stderr: {result.stderr[:2000]}")
+            raise subprocess.CalledProcessError(
+                result.returncode, full_command, result.stdout, result.stderr
+            )
 
         return result
 
@@ -794,6 +814,21 @@ exit $COPY_EXIT
         """
         daemon_port = 873
 
+        if self.dry_run:
+            subpath = ''
+            if location.scheme in ('docker-volume', 'directory'):
+                parts = location.path.split('/', 1)
+                subpath = '/' + parts[1] if len(parts) > 1 else ''
+            elif location.scheme == 'k8s-pvc':
+                parts = location.path.split('/', 2)
+                subpath = '/' + parts[2] if len(parts) > 2 else ''
+            print(f"[DRY RUN] Would start rsync-p2p daemon on {location.host} for {location.scheme}:{location.path}")
+            return {
+                'type': 'dry-run',
+                'malai_id': 'dry-run-id',
+                'subpath': subpath
+            }
+
         if location.scheme == 'docker-volume':
             # Parse volume name and subpath
             parts = location.path.split('/', 1)
@@ -1005,6 +1040,10 @@ exit $COPY_EXIT
         Args:
             malai_connection: Dict with 'malai_id' and 'subpath' from daemon
         """
+        if self.dry_run:
+            print(f"[DRY RUN] Would run rsync-p2p client on {target.host} for {target.scheme}:{target.path}")
+            return
+
         malai_id = malai_connection['malai_id']
         source_subpath = malai_connection.get('subpath', '')
 
@@ -1142,24 +1181,39 @@ exit $COPY_EXIT
             # Wait for pod to complete
             print(f"  ⏳ Waiting for rsync-p2p client to complete...")
             wait_cmd = f"wait --for=jsonpath='{{.status.phase}}'=Succeeded pod/{pod_name} -n {namespace} --timeout=300s"
+            pod_succeeded = False
             try:
                 self.execute_kubectl(context, wait_cmd)
-            except subprocess.CalledProcessError as e:
+                pod_succeeded = True
+            except subprocess.CalledProcessError:
                 # Pod might have failed, check its status
                 status_cmd = f"get pod/{pod_name} -n {namespace} -o jsonpath='{{.status.phase}}'"
                 result = self.execute_kubectl(context, status_cmd)
-                if result.stdout.strip() != 'Succeeded':
-                    raise Exception(f"Rsync client pod failed with status: {result.stdout}")
+                pod_phase = result.stdout.strip()
+                if pod_phase == 'Succeeded':
+                    pod_succeeded = True
 
-            # Get logs if debug mode
-            if self.debug:
+            # Always fetch pod logs on failure, or in debug mode on success
+            if not pod_succeeded or self.debug:
                 logs_cmd = f"logs {pod_name} -n {namespace}"
-                result = self.execute_kubectl(context, logs_cmd)
-                print(f"[DEBUG] Rsync-p2p output: {result.stdout}")
+                try:
+                    result = self.execute_kubectl(context, logs_cmd)
+                    label = "Rsync-p2p client logs" if not pod_succeeded else "[DEBUG] Rsync-p2p output"
+                    print(f"  {label}:\n{result.stdout}")
+                    if result.stderr:
+                        print(f"  stderr:\n{result.stderr}")
+                except Exception as log_err:
+                    print(f"  Failed to fetch pod logs: {log_err}")
 
-            # Delete client pod
+            # Always delete client pod
             delete_cmd = f"delete pod {pod_name} -n {namespace} --force --grace-period=0"
-            self.execute_kubectl(context, delete_cmd)
+            try:
+                self.execute_kubectl(context, delete_cmd)
+            except Exception as cleanup_err:
+                print(f"  Failed to cleanup rsync client pod: {cleanup_err}")
+
+            if not pod_succeeded:
+                raise Exception(f"Rsync client pod failed with status: {pod_phase}")
 
         elif target.scheme == 'directory':
             container_name = f"rsync-client-{unique_id}"
@@ -1223,6 +1277,9 @@ exit $COPY_EXIT
 
     def _cleanup_rsync_daemon(self, daemon_info: dict):
         """Cleanup rsync daemon resources."""
+        if daemon_info['type'] == 'dry-run':
+            return
+
         print(f"  🧹 Cleaning up rsync-p2p daemon...")
 
         if daemon_info['type'] in ('docker-p2p', 'docker'):
@@ -1256,6 +1313,15 @@ exit $COPY_EXIT
 
         Returns volume name or path.
         """
+        if self.dry_run:
+            volume_name = f"pg-dump-{unique_id}"
+            if self.is_k8s_context(location.host):
+                print(f"[DRY RUN] Would create temporary PVC: default/{volume_name}")
+                return f"default/{volume_name}"
+            else:
+                print(f"[DRY RUN] Would create temporary Docker volume: {volume_name}")
+                return volume_name
+
         if self.is_k8s_context(location.host):
             context = self.get_k8s_context(location.host)
             if '/' in location.host:
@@ -1306,6 +1372,9 @@ exit $COPY_EXIT
 
     def _cleanup_temp_volume(self, location: Location, volume_identifier: str):
         """Cleanup temporary volume."""
+        if self.dry_run:
+            return
+
         print(f"  🧹 Cleaning up temporary volume...")
 
         if self.is_k8s_context(location.host):
@@ -1327,6 +1396,10 @@ exit $COPY_EXIT
 
     def _pg_dump_to_volume(self, source: Location, volume_identifier: str, unique_id: str):
         """Run pg_dump and save output to a volume."""
+        if self.dry_run:
+            print(f"[DRY RUN] Would run pg_dump from {source.service_name} to volume {volume_identifier}")
+            return
+
         print(f"  📊 Running pg_dump to volume...")
 
         dump_file = "/dump/database.pgdump"
@@ -1411,6 +1484,10 @@ exit $COPY_EXIT
 
     def _pg_restore_from_volume(self, target: Location, volume_identifier: str, unique_id: str):
         """Run pg_restore from a volume."""
+        if self.dry_run:
+            print(f"[DRY RUN] Would run pg_restore to {target.service_name} from volume {volume_identifier}")
+            return
+
         print(f"  🚀 Running pg_restore from volume...")
 
         dump_file = "/dump/database.pgdump"
