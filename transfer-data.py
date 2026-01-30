@@ -1062,15 +1062,26 @@ exit $COPY_EXIT
             self.execute_kubectl(context, f"delete pod {pod_name} -n {pvc_namespace} --force --grace-period=0")
         else:
             container_name = f"pg-dump-{unique_id}"
-            dump_cmd = (
-                f"docker run --pull always --rm --name {container_name} "
+            pull_cmd = f"docker pull postgres:alpine"
+            self.execute_on_host(source.host, pull_cmd)
+
+            start_cmd = (
+                f"docker run -d --name {container_name} "
                 f"--network container:{source.service_name} "
                 f"-v {volume_identifier}:/dump "
                 f"-e PGPASSWORD={source.password or ''} "
                 f"postgres:alpine "
                 f"pg_dump -h localhost -U {source.username} -Fc -f {dump_file} {source.path}"
             )
-            self.execute_on_host(source.host, dump_cmd)
+            self.execute_on_host(source.host, start_cmd)
+
+            wait_result = self.execute_on_host(source.host, f"docker wait {container_name}")
+            exit_code = wait_result.stdout.strip()
+            if exit_code != '0':
+                logs = self.execute_on_host(source.host, f"docker logs {container_name}")
+                self.execute_on_host(source.host, f"docker rm -f {container_name}")
+                raise Exception(f"pg_dump container exited with code {exit_code}: {logs.stdout}")
+            self.execute_on_host(source.host, f"docker rm -f {container_name}")
 
         print(f"  ✅ pg_dump completed")
 
@@ -1131,15 +1142,26 @@ exit $COPY_EXIT
             self.execute_kubectl(context, f"delete pod {pod_name} -n {pvc_namespace} --force --grace-period=0")
         else:
             container_name = f"pg-restore-{unique_id}"
-            restore_cmd = (
-                f"docker run --pull always --rm --name {container_name} "
+            pull_cmd = f"docker pull postgres:alpine"
+            self.execute_on_host(target.host, pull_cmd)
+
+            start_cmd = (
+                f"docker run -d --name {container_name} "
                 f"--network container:{target.service_name} "
                 f"-v {volume_identifier}:/dump "
                 f"-e PGPASSWORD={target.password or ''} "
                 f"postgres:alpine "
                 f"sh -c \"pg_restore -h localhost -U {target.username} -j4 --no-owner --clean -d {target.path} {dump_file} 2>&1 | grep -v 'transaction_timeout' || true\""
             )
-            self.execute_on_host(target.host, restore_cmd)
+            self.execute_on_host(target.host, start_cmd)
+
+            wait_result = self.execute_on_host(target.host, f"docker wait {container_name}")
+            exit_code = wait_result.stdout.strip()
+            if exit_code != '0':
+                logs = self.execute_on_host(target.host, f"docker logs {container_name}")
+                self.execute_on_host(target.host, f"docker rm -f {container_name}")
+                raise Exception(f"pg_restore container exited with code {exit_code}: {logs.stdout}")
+            self.execute_on_host(target.host, f"docker rm -f {container_name}")
 
         print(f"  ✅ pg_restore completed")
 
