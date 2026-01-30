@@ -301,24 +301,37 @@ class TransferEngine:
         if self.debug:
             print(f"[DEBUG] Executing on {host}: {command}")
 
-        if self.is_localhost(host):
-            result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
-        else:
-            result = subprocess.run(
-                ['ssh', host, command],
-                capture_output=True,
-                text=True,
-                check=False
-            )
+        is_ssh = not self.is_localhost(host)
+        max_attempts = 5 if is_ssh else 1
 
-        if self.debug:
-            print(f"[DEBUG] Command exit code: {result.returncode}")
-            if result.stdout:
-                print(f"[DEBUG] stdout: {result.stdout[:500]}")
-            if result.stderr:
-                print(f"[DEBUG] stderr: {result.stderr[:500]}")
+        for attempt in range(1, max_attempts + 1):
+            if self.is_localhost(host):
+                result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
+            else:
+                result = subprocess.run(
+                    ['ssh', host, command],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
 
-        if result.returncode != 0:
+            if self.debug:
+                print(f"[DEBUG] Command exit code: {result.returncode}")
+                if result.stdout:
+                    print(f"[DEBUG] stdout: {result.stdout[:500]}")
+                if result.stderr:
+                    print(f"[DEBUG] stderr: {result.stderr[:500]}")
+
+            if result.returncode == 0:
+                return result
+
+            # SSH exit code 255 = connection failure (transient, worth retrying)
+            if is_ssh and result.returncode == 255 and attempt < max_attempts:
+                delay = 2 ** attempt
+                print(f"  SSH connection failed (attempt {attempt}/{max_attempts}), retrying in {delay}s...")
+                time.sleep(delay)
+                continue
+
             print(f"  Command failed (exit {result.returncode}) on {host}: {command}")
             if result.stdout:
                 print(f"  stdout: {result.stdout[:2000]}")
@@ -328,7 +341,7 @@ class TransferEngine:
                 result.returncode, result.args, result.stdout, result.stderr
             )
 
-        return result
+        assert False, "unreachable"
 
     def execute_kubectl(self, context: str, command: str) -> subprocess.CompletedProcess:
         if self.dry_run:
