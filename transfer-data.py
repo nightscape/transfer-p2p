@@ -231,6 +231,26 @@ class TransferEngine:
         finally:
             os.unlink(spec_file)
 
+    def _find_node_for_pvc(self, context: str, namespace: str, pvc_name: str) -> Optional[str]:
+        """Find the node where a PVC is currently mounted by querying running pods."""
+        result = self.execute_kubectl(
+            context,
+            f"get pods -n {namespace} -o json"
+        )
+        pods = json.loads(result.stdout)
+        for pod in pods.get("items", []):
+            if pod.get("status", {}).get("phase") != "Running":
+                continue
+            for volume in pod.get("spec", {}).get("volumes", []):
+                claim = volume.get("persistentVolumeClaim", {})
+                if claim.get("claimName") == pvc_name:
+                    node = pod.get("spec", {}).get("nodeName")
+                    if node:
+                        if self.debug:
+                            print(f"[DEBUG] PVC {pvc_name} is mounted by pod {pod['metadata']['name']} on node {node}")
+                        return node
+        return None
+
     def _parse_postgres_service(self, service_name: str) -> Tuple[str, str]:
         """Returns (pod_name, namespace) from a postgres service_name like 'pod.namespace.svc.cluster.local'."""
         parts = service_name.split('.')
@@ -760,6 +780,11 @@ exit $COPY_EXIT
                 }
             }
 
+            node = self._find_node_for_pvc(context, namespace, pvc)
+            if node:
+                pod_spec["spec"]["nodeName"] = node
+                print(f"  📌 Pinning daemon pod to node {node} (co-locating with PVC {pvc})")
+
             print(f"  🚀 Starting rsync-p2p daemon pod (Malai P2P) in K8s...")
 
             self._kubectl_apply_spec(context, pod_spec)
@@ -882,6 +907,11 @@ exit $COPY_EXIT
                     "restartPolicy": "Never"
                 }
             }
+
+            node = self._find_node_for_pvc(context, namespace, pvc)
+            if node:
+                pod_spec["spec"]["nodeName"] = node
+                print(f"  📌 Pinning client pod to node {node} (co-locating with PVC {pvc})")
 
             print(f"  🔄 Running rsync-p2p client pod (Malai P2P) in K8s...")
             if self.debug:
