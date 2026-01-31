@@ -10,7 +10,9 @@ URL Schema:
   docker-volume:/volume-name[/path]            - Docker volume (host from FROM_HOST/TO_HOST)
   k8s-pvc:/namespace/pvc-name[/path]           - K8s PVC (context from k8s:CONTEXT host)
   directory:/path                               - Filesystem directory
-  weaviate://[api-key:KEY@]host[:port]         - Weaviate instance
+  weaviate://[api-key:KEY@]host[:port]         - Weaviate instance (P2P object copy)
+  weaviate://host[:port]/docker-volume/VOL     - Weaviate with backup/restore via Docker volume
+  weaviate://host[:port]/k8s-pvc/NS/PVC        - Weaviate with backup/restore via K8s PVC
   postgres://user:pass@container-or-pod/database - Postgres database (via pg_dump/restore)
 
 Transfer Methods:
@@ -75,11 +77,15 @@ import argparse
 import json
 import logging
 import os
+import shlex
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
+import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from urllib.parse import urlparse
@@ -97,6 +103,8 @@ class Location:
     password: Optional[str]
     port: Optional[int]
     service_name: Optional[str] = None
+    volume_type: Optional[str] = None
+    volume_id: Optional[str] = None
 
     @classmethod
     def parse(cls, url: str, default_host: Optional[str] = None) -> 'Location':
@@ -164,14 +172,28 @@ class Location:
             port = parsed.port
             if port is None:
                 port = 80
+
+            volume_type = None
+            volume_id = None
+            path = parsed.path or '/'
+            path_stripped = path.strip('/')
+            if path_stripped.startswith('docker-volume/'):
+                volume_type = 'docker-volume'
+                volume_id = path_stripped[len('docker-volume/'):]
+            elif path_stripped.startswith('k8s-pvc/'):
+                volume_type = 'k8s-pvc'
+                volume_id = path_stripped[len('k8s-pvc/'):]
+
             return cls(
                 scheme='weaviate',
                 host=default_host,
-                path=parsed.path or '/',
+                path=path,
                 username=parsed.username,
                 password=parsed.password,
                 port=port,
-                service_name=parsed.hostname
+                service_name=parsed.hostname,
+                volume_type=volume_type,
+                volume_id=volume_id,
             )
 
         elif parsed.scheme == 'postgres':
@@ -188,6 +210,39 @@ class Location:
 
         else:
             raise ValueError(f"Unsupported scheme: {parsed.scheme}")
+
+    @property
+    def subpath(self) -> str:
+        if self.scheme == 'docker-volume':
+            parts = self.path.split('/', 1)
+            return '/' + parts[1] if len(parts) > 1 else ''
+        elif self.scheme == 'k8s-pvc':
+            parts = self.path.split('/', 2)
+            return '/' + parts[2] if len(parts) > 2 else ''
+        return ''
+
+    @property
+    def namespace(self) -> str:
+        assert self.scheme == 'k8s-pvc', f"namespace only valid for k8s-pvc, got {self.scheme}"
+        return self.path.split('/', 2)[0]
+
+    @property
+    def pvc_name(self) -> str:
+        assert self.scheme == 'k8s-pvc', f"pvc_name only valid for k8s-pvc, got {self.scheme}"
+        return self.path.split('/', 2)[1]
+
+    @property
+    def volume_name(self) -> str:
+        assert self.scheme == 'docker-volume', f"volume_name only valid for docker-volume, got {self.scheme}"
+        return self.path.split('/', 1)[0]
+
+    def docker_volume_arg(self, mount_path: str = '/data', read_only: bool = False) -> str:
+        ro = ':ro' if read_only else ''
+        if self.scheme == 'docker-volume':
+            return f"-v {self.volume_name}:{mount_path}{ro}"
+        elif self.scheme == 'directory':
+            return f"-v {self.path}:{mount_path}{ro}"
+        raise ValueError(f"docker_volume_arg not supported for {self.scheme}")
 
 
 class TransferEngine:
@@ -230,6 +285,45 @@ class TransferEngine:
             self.execute_kubectl(context, f"apply -f {spec_file}")
         finally:
             os.unlink(spec_file)
+
+    def _find_selinux_level_for_pvc(self, context: str, namespace: str, pvc_name: str) -> Optional[str]:
+        """Find the SELinux level of a running pod that mounts a given PVC.
+
+        On clusters with SELinux enforcing, any new pod mounting a PVC triggers
+        volume relabeling. If the new pod's SELinux level differs from the
+        existing pod's level, the existing pod loses access to its files.
+        By matching the SELinux level, we avoid this problem.
+        """
+        result = self.execute_kubectl(
+            context,
+            f"get pods -n {namespace} -o json"
+        )
+        pods = json.loads(result.stdout)
+        for pod in pods.get("items", []):
+            if pod.get("status", {}).get("phase") != "Running":
+                continue
+            for volume in pod.get("spec", {}).get("volumes", []):
+                claim = volume.get("persistentVolumeClaim", {})
+                if claim.get("claimName") == pvc_name:
+                    pod_name = pod["metadata"]["name"]
+                    try:
+                        result = self.execute_kubectl(
+                            context,
+                            f"exec {pod_name} -n {namespace} -- cat /proc/1/attr/current"
+                        )
+                        # Format: system_u:system_r:container_t:s0:c749,c910
+                        context_str = result.stdout.strip().rstrip('\x00')
+                        parts = context_str.split(':')
+                        if len(parts) >= 4:
+                            level = ':'.join(parts[3:])
+                            if self.debug:
+                                print(f"[DEBUG] SELinux level for PVC {pvc_name} (from pod {pod_name}): {level}")
+                            return level
+                    except (subprocess.CalledProcessError, Exception) as e:
+                        if self.debug:
+                            print(f"[DEBUG] Failed to get SELinux level from pod {pod_name}: {e}")
+                        continue
+        return None
 
     def _find_node_for_pvc(self, context: str, namespace: str, pvc_name: str) -> Optional[str]:
         """Find the node where a PVC is currently mounted by querying running pods."""
@@ -295,10 +389,273 @@ class TransferEngine:
                 if self.debug:
                     print(f"[DEBUG] Failed to cleanup container {container_name}: {e}")
 
+    def _run_docker_to_completion(self, host: str, container_name: str, run_cmd: str):
+        """Start a detached container, wait for exit, raise on failure, cleanup."""
+        self.execute_on_host(host, run_cmd)
+        wait_result = self.execute_on_host(host, f"docker wait {container_name}")
+        exit_code = wait_result.stdout.strip()
+        if exit_code != '0':
+            logs = self.execute_on_host(host, f"docker logs {container_name}")
+            self.execute_on_host(host, f"docker rm -f {container_name}")
+            raise Exception(f"Container {container_name} exited with code {exit_code}: {logs.stdout}")
+        self.execute_on_host(host, f"docker rm -f {container_name}")
+
+    def _make_pvc_pod_spec(
+        self, pod_name: str, namespace: str, pvc_name: str,
+        container_name: str, image: str,
+        command: Optional[List[str]] = None, args: Optional[List[str]] = None,
+        env: Optional[List[dict]] = None, mount_path: str = '/data',
+        read_only: bool = False, node_name: Optional[str] = None,
+        se_linux_level: Optional[str] = None,
+    ) -> dict:
+        container = {
+            "name": container_name,
+            "image": image,
+            "imagePullPolicy": "Always",
+            "volumeMounts": [{"name": "data", "mountPath": mount_path}]
+        }
+        if read_only:
+            container["volumeMounts"][0]["readOnly"] = True
+        if command:
+            container["command"] = command
+        if args:
+            container["args"] = args
+        if env:
+            container["env"] = env
+        spec = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": pod_name, "namespace": namespace},
+            "spec": {
+                "containers": [container],
+                "volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": pvc_name}}],
+                "restartPolicy": "Never"
+            }
+        }
+        if node_name:
+            spec["spec"]["nodeName"] = node_name
+        if se_linux_level:
+            spec["spec"]["securityContext"] = {
+                "seLinuxOptions": {"level": se_linux_level}
+            }
+        return spec
+
+    def _run_k8s_pod_to_completion(self, context: str, pod_spec: dict, timeout: int = 300) -> Optional[str]:
+        """Apply pod, wait for Succeeded, return logs, cleanup. Raises on failure."""
+        name = pod_spec['metadata']['name']
+        ns = pod_spec['metadata']['namespace']
+
+        self._kubectl_apply_spec(context, pod_spec)
+
+        wait_cmd = f"wait --for=jsonpath='{{.status.phase}}'=Succeeded pod/{name} -n {ns} --timeout={timeout}s"
+        succeeded = False
+        try:
+            self.execute_kubectl(context, wait_cmd)
+            succeeded = True
+        except subprocess.CalledProcessError:
+            result = self.execute_kubectl(context, f"get pod/{name} -n {ns} -o jsonpath='{{.status.phase}}'")
+            if result.stdout.strip() == 'Succeeded':
+                succeeded = True
+
+        logs = None
+        if not succeeded or self.debug:
+            try:
+                result = self.execute_kubectl(context, f"logs {name} -n {ns}")
+                logs = result.stdout
+                if self.debug:
+                    print(f"  [DEBUG] Pod {name} output:\n{logs}")
+                if result.stderr:
+                    print(f"  stderr:\n{result.stderr}")
+            except Exception as e:
+                print(f"  Failed to fetch pod logs: {e}")
+
+        try:
+            self.execute_kubectl(context, f"delete pod {name} -n {ns} --force --grace-period=0")
+        except Exception as e:
+            if self.debug:
+                print(f"[DEBUG] Failed to delete pod {name}: {e}")
+
+        if not succeeded:
+            raise Exception(f"Pod {name} failed. Logs: {logs}")
+
+        return logs
+
     def _weaviate_network_mode(self, service_name: str) -> str:
         if service_name in ('localhost', '127.0.0.1', '::1'):
             return "host"
         return f"container:{service_name}"
+
+    # --- Weaviate backup/restore API infrastructure ---
+
+    def _find_free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('', 0))
+            return s.getsockname()[1]
+
+    def _resolve_weaviate_k8s_namespace(self, location: Location) -> str:
+        assert location.volume_type == 'k8s-pvc'
+        parts = location.volume_id.split('/', 1)
+        assert len(parts) == 2, f"Expected namespace/pvc-name in volume_id, got: {location.volume_id}"
+        return parts[0]
+
+    def _fetch_k8s_weaviate_api_key(self, context: str, namespace: str) -> Optional[str]:
+        import base64
+        for key_name in ('key', 'api-key', 'apikey'):
+            try:
+                result = self.execute_kubectl(
+                    context,
+                    f"get secret weaviate-api-key -n {namespace} -o jsonpath='{{.data.{key_name}}}'"
+                )
+                encoded = result.stdout.strip().strip("'")
+                if encoded:
+                    decoded = base64.b64decode(encoded).decode()
+                    if self.debug:
+                        print(f"[DEBUG] Found K8s Weaviate API key in secret field '{key_name}'")
+                    return decoded
+            except subprocess.CalledProcessError:
+                continue
+        return None
+
+    def _resolve_docker_container_name(self, host: str, service_name: str) -> str:
+        """Resolve a compose service name to the actual Docker container name.
+
+        Tries compose service label first, falls back to name filter.
+        """
+        cmd = f"docker ps --filter label=com.docker.compose.service={service_name} --format '{{{{.Names}}}}'"
+        result = self.execute_on_host(host, cmd)
+        names = [n for n in result.stdout.strip().splitlines() if n]
+        if not names:
+            cmd = f"docker ps --filter name={service_name} --format '{{{{.Names}}}}'"
+            result = self.execute_on_host(host, cmd)
+            names = [n for n in result.stdout.strip().splitlines() if n]
+        assert len(names) == 1, f"Expected exactly 1 container matching '{service_name}', got {len(names)}: {names}"
+        return names[0]
+
+    def _fetch_docker_weaviate_api_key(self, host: str, container_name: str) -> Optional[str]:
+        """Fetch AUTHENTICATION_APIKEY_ALLOWED_KEYS from a running Weaviate Docker container."""
+        cmd = f"docker exec {container_name} printenv AUTHENTICATION_APIKEY_ALLOWED_KEYS"
+        try:
+            result = self.execute_on_host(host, cmd)
+            keys = result.stdout.strip()
+            if keys:
+                return keys.split(',')[0]
+        except subprocess.CalledProcessError:
+            pass
+        return None
+
+    @contextmanager
+    def _docker_weaviate_api(self, location: Location):
+        """Context manager yielding an api_call(method, endpoint, body=None) function for Docker-hosted Weaviate."""
+        service_name = location.service_name
+        port = location.port
+        host = location.host
+        unique_id = self._generate_unique_id()
+
+        if not self.dry_run:
+            docker_container = self._resolve_docker_container_name(host, service_name)
+            api_key = self._fetch_docker_weaviate_api_key(host, docker_container)
+            if self.debug:
+                print(f"[DEBUG] Resolved Docker container: {docker_container}, has_api_key={bool(api_key)}")
+        else:
+            docker_container = service_name
+            api_key = None
+
+        def api_call(method: str, endpoint: str, body: dict = None) -> dict:
+            url = f"http://localhost:{port}{endpoint}"
+            curl_args = ["-s", "-X", method, url, "-H", "Content-Type: application/json"]
+            if api_key:
+                curl_args.extend(["-H", f"Authorization: Bearer {api_key}"])
+            if body is not None:
+                body_json = json.dumps(body)
+                curl_args.extend(["-d", body_json])
+
+            container_name = f"weaviate-api-{unique_id}-{self._generate_unique_id()}"
+            quoted_curl_args = ' '.join(shlex.quote(a) for a in curl_args)
+            cmd = (
+                f"docker run --rm --name {container_name} "
+                f"--network container:{docker_container} "
+                f"curlimages/curl {quoted_curl_args}"
+            )
+
+            if self.dry_run:
+                print(f"[DRY RUN] Would execute on {host}: {cmd}")
+                return {}
+
+            if self.debug:
+                print(f"[DEBUG] Weaviate API {method} {endpoint} via Docker curl")
+
+            result = self.execute_on_host(host, cmd)
+            if not result.stdout.strip():
+                return {}
+            return json.loads(result.stdout)
+
+        yield api_call
+
+    @contextmanager
+    def _k8s_weaviate_api(self, location: Location):
+        """Context manager yielding an api_call(method, endpoint, body=None) function for K8s-hosted Weaviate."""
+        context = self.get_k8s_context(location.host)
+        namespace = self._resolve_weaviate_k8s_namespace(location)
+        api_key = self._fetch_k8s_weaviate_api_key(context, namespace)
+
+        local_port = self._find_free_port()
+
+        svc_name = location.service_name
+        svc_port = location.port
+        fwd_cmd = f"kubectl --context={context} port-forward -n {namespace} svc/{svc_name} {local_port}:{svc_port}"
+
+        if self.dry_run:
+            def api_call(method: str, endpoint: str, body: dict = None) -> dict:
+                print(f"[DRY RUN] Would call Weaviate API: {method} {endpoint}")
+                return {}
+            yield api_call
+            return
+
+        if self.debug:
+            print(f"[DEBUG] Starting port-forward: {fwd_cmd}")
+
+        proc = subprocess.Popen(fwd_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(3)
+
+        try:
+            def api_call(method: str, endpoint: str, body: dict = None) -> dict:
+                url = f"http://localhost:{local_port}{endpoint}"
+                data = json.dumps(body).encode() if body is not None else None
+                req = urllib.request.Request(url, data=data, method=method)
+                req.add_header("Content-Type", "application/json")
+                if api_key:
+                    req.add_header("Authorization", f"Bearer {api_key}")
+
+                if self.debug:
+                    print(f"[DEBUG] Weaviate API {method} {endpoint} via port-forward :{local_port}, has_api_key={bool(api_key)}")
+
+                try:
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        resp_body = resp.read().decode()
+                        if not resp_body.strip():
+                            return {}
+                        return json.loads(resp_body)
+                except urllib.error.HTTPError as e:
+                    error_body = e.read().decode() if e.fp else ""
+                    raise Exception(f"Weaviate API {method} {endpoint} returned HTTP {e.code}: {error_body}") from e
+
+            yield api_call
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    @contextmanager
+    def _weaviate_api_context(self, location: Location):
+        """Dispatch to Docker or K8s Weaviate API context manager."""
+        assert location.volume_type in ('docker-volume', 'k8s-pvc'), \
+            f"Cannot create Weaviate API context without volume_type, got: {location.volume_type}"
+
+        if location.volume_type == 'k8s-pvc':
+            with self._k8s_weaviate_api(location) as api_call:
+                yield api_call
+        else:
+            with self._docker_weaviate_api(location) as api_call:
+                yield api_call
 
     # --- Host execution ---
 
@@ -688,6 +1045,230 @@ exit $COPY_EXIT
             if source_tunnel:
                 self._cleanup_tcp_tunnel(source_tunnel)
 
+    # --- Weaviate backup/restore transfer ---
+
+    def _weaviate_poll_status(self, api_fn, endpoint: str, timeout: int = 300) -> str:
+        """Poll a Weaviate backup status endpoint until SUCCESS or FAILED."""
+        if self.dry_run:
+            print(f"[DRY RUN] Would poll {endpoint} until SUCCESS")
+            return "SUCCESS"
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            resp = api_fn("GET", endpoint)
+            status = resp.get("status", "UNKNOWN")
+            if self.debug:
+                print(f"[DEBUG] Poll {endpoint}: status={status}")
+            if status == "SUCCESS":
+                return status
+            if status == "FAILED":
+                raise Exception(f"Weaviate backup operation failed: {resp}")
+            time.sleep(5)
+        raise Exception(f"Weaviate backup operation timed out after {timeout}s on {endpoint}")
+
+    def _make_volume_location(self, weaviate_loc: Location, subpath: str) -> Location:
+        """Convert a weaviate Location to a file-based Location for rsync of backup files."""
+        assert weaviate_loc.volume_type in ('docker-volume', 'k8s-pvc')
+
+        if weaviate_loc.volume_type == 'docker-volume':
+            return Location(
+                scheme='docker-volume',
+                host=weaviate_loc.host,
+                path=f"{weaviate_loc.volume_id}/{subpath}",
+                username=None,
+                password=None,
+                port=None,
+            )
+        else:
+            ns, pvc = weaviate_loc.volume_id.split('/', 1)
+            return Location(
+                scheme='k8s-pvc',
+                host=weaviate_loc.host,
+                path=f"{ns}/{pvc}/{subpath}",
+                username=None,
+                password=None,
+                port=None,
+            )
+
+    def _cleanup_weaviate_backup(self, location: Location, backup_id: str):
+        """Remove backup files from the Weaviate data volume (best-effort)."""
+        backup_path = f"backups/{backup_id}"
+
+        if location.volume_type == 'docker-volume':
+            container_name = f"weaviate-cleanup-{self._generate_unique_id()}"
+            cmd = (
+                f"docker run --rm --name {container_name} "
+                f"-v {location.volume_id}:/data "
+                f"alpine rm -rf /data/{backup_path}"
+            )
+            try:
+                self.execute_on_host(location.host, cmd)
+            except Exception as e:
+                if self.debug:
+                    print(f"[DEBUG] Backup cleanup failed on {location.host}: {e}")
+
+        elif location.volume_type == 'k8s-pvc':
+            context = self.get_k8s_context(location.host)
+            ns, pvc = location.volume_id.split('/', 1)
+            pod_name = f"weaviate-cleanup-{self._generate_unique_id()}"
+            se_linux_level = self._find_selinux_level_for_pvc(context, ns, pvc)
+
+            pod_spec = self._make_pvc_pod_spec(
+                pod_name, ns, pvc,
+                container_name="cleanup",
+                image="alpine",
+                command=["rm", "-rf", f"/data/{backup_path}"],
+                se_linux_level=se_linux_level,
+            )
+            try:
+                self._run_k8s_pod_to_completion(context, pod_spec, timeout=60)
+            except Exception as e:
+                if self.debug:
+                    print(f"[DEBUG] Backup cleanup failed on K8s: {e}")
+
+    def _get_weaviate_node_names(self, api_fn) -> List[str]:
+        """Get node names from a Weaviate instance via its API."""
+        resp = api_fn("GET", "/v1/nodes")
+        if not resp:
+            return []
+        return [n["name"] for n in resp.get("nodes", [])]
+
+    def _build_node_mapping(self, src_api_fn, tgt_api_fn) -> Optional[dict]:
+        """Build a node_mapping dict for restore if source and target node names differ."""
+        src_nodes = self._get_weaviate_node_names(src_api_fn)
+        tgt_nodes = self._get_weaviate_node_names(tgt_api_fn)
+        if not src_nodes or not tgt_nodes:
+            return None
+        if src_nodes == tgt_nodes:
+            return None
+        assert len(src_nodes) == len(tgt_nodes), (
+            f"Source has {len(src_nodes)} nodes but target has {len(tgt_nodes)}. "
+            f"Cross-cluster restore with different replica counts is not supported."
+        )
+        mapping = dict(zip(src_nodes, tgt_nodes))
+        print(f"  🔀 Node mapping: {mapping}")
+        return mapping
+
+    def _rewrite_backup_node_names(self, location: Location, backup_id: str, node_mapping: dict):
+        """Rewrite node names in backup files on the target volume.
+
+        Weaviate's node_mapping restore parameter doesn't reliably remap shards
+        in all versions. This directly renames node directories and rewrites
+        backup_config.json to use the target node names.
+        """
+        # Rewrite all JSON files in the backup directory and rename node directories.
+        # The node name appears in backup_config.json, backup.json (per-node), and
+        # potentially other metadata files.
+        sed_commands = []
+        rename_commands = []
+        for old_name, new_name in node_mapping.items():
+            sed_commands.append(
+                f"find /data/backups/{backup_id} -name '*.json' -exec "
+                f"sed -i 's/{old_name}/{new_name}/g' {{}} +"
+            )
+            rename_commands.append(
+                f'[ -d "/data/backups/{backup_id}/{old_name}" ] && '
+                f'mv "/data/backups/{backup_id}/{old_name}" "/data/backups/{backup_id}/{new_name}"'
+            )
+
+        rewrite_script = " && ".join(sed_commands + rename_commands)
+
+        if location.volume_type == 'docker-volume':
+            container_name = f"backup-rewrite-{self._generate_unique_id()}"
+            cmd = (
+                f"docker run --rm --name {container_name} "
+                f"-v {location.volume_id}:/data "
+                f"alpine sh -c '{rewrite_script}'"
+            )
+            self.execute_on_host(location.host, cmd)
+
+        elif location.volume_type == 'k8s-pvc':
+            context = self.get_k8s_context(location.host)
+            ns, pvc = location.volume_id.split('/', 1)
+            pod_name = f"backup-rewrite-{self._generate_unique_id()}"
+            se_linux_level = self._find_selinux_level_for_pvc(context, ns, pvc)
+
+            pod_spec = self._make_pvc_pod_spec(
+                pod_name, ns, pvc,
+                container_name="rewrite",
+                image="alpine",
+                command=["sh", "-c", rewrite_script],
+                se_linux_level=se_linux_level,
+            )
+            self._run_k8s_pod_to_completion(context, pod_spec, timeout=60)
+
+    def transfer_weaviate_backup_restore(
+        self,
+        source: Location,
+        target: Location,
+        exclude: Optional[List[str]] = None
+    ):
+        """Transfer Weaviate data using backup API → rsync → restore API.
+
+        This avoids copying Raft consensus metadata which causes crashes when
+        the target node has a different identity.
+        """
+        backup_id = f"transfer-{self._generate_unique_id()}"
+        print(f"🔄 Transferring Weaviate via backup/restore: {source.service_name} → {target.service_name}")
+        print(f"  📋 Backup ID: {backup_id}")
+
+        if self.debug:
+            print(f"[DEBUG] Source: host={source.host}, volume_type={source.volume_type}, volume_id={source.volume_id}")
+            print(f"[DEBUG] Target: host={target.host}, volume_type={target.volume_type}, volume_id={target.volume_id}")
+
+        # Phase 0: Detect node mapping (before backup, while both are accessible)
+        node_mapping = None
+        with self._weaviate_api_context(source) as src_api:
+            with self._weaviate_api_context(target) as tgt_api:
+                node_mapping = self._build_node_mapping(src_api, tgt_api)
+
+        # Phase 1: Create backup on source
+        print(f"  📦 Phase 1: Creating backup on source...")
+        with self._weaviate_api_context(source) as src_api:
+            src_api("POST", "/v1/backups/filesystem", {"id": backup_id})
+            self._weaviate_poll_status(src_api, f"/v1/backups/filesystem/{backup_id}")
+        print(f"  ✅ Backup created on source")
+
+        try:
+            # Phase 2: Transfer backup files via rsync
+            print(f"  🔄 Phase 2: Transferring backup files...")
+            source_loc = self._make_volume_location(source, f"backups/{backup_id}")
+            target_loc = self._make_volume_location(target, f"backups/{backup_id}")
+            self.transfer_rsync_daemon(
+                source_loc, target_loc, exclude=None,
+                post_sync_command=f"chmod -R a+rX /data/backups/{backup_id}",
+            )
+            print(f"  ✅ Backup files transferred")
+
+            # Phase 3: Restore on target
+            print(f"  🚀 Phase 3: Restoring on target...")
+            restore_body = {}
+            if node_mapping:
+                restore_body["node_mapping"] = node_mapping
+            with self._weaviate_api_context(target) as tgt_api:
+                # Delete existing classes that conflict with the backup
+                schema = tgt_api("GET", "/v1/schema")
+                existing_classes = [c["class"] for c in schema.get("classes", [])] if schema else []
+                if existing_classes:
+                    print(f"  🗑️  Deleting existing classes on target: {existing_classes}")
+                    for cls_name in existing_classes:
+                        tgt_api("DELETE", f"/v1/schema/{cls_name}")
+                    print(f"  ✅ Existing classes deleted")
+
+                tgt_api("POST", f"/v1/backups/filesystem/{backup_id}/restore", restore_body)
+                self._weaviate_poll_status(tgt_api, f"/v1/backups/filesystem/{backup_id}/restore")
+            print(f"  ✅ Restore completed on target")
+
+        finally:
+            # Phase 4: Cleanup (best-effort)
+            print(f"  🧹 Phase 4: Cleaning up backup files...")
+            if not self.dry_run:
+                self._cleanup_weaviate_backup(source, backup_id)
+                self._cleanup_weaviate_backup(target, backup_id)
+            print(f"  ✅ Cleanup done")
+
+        print("  ✅ Weaviate backup/restore transfer completed successfully")
+
     # --- Rsync daemon (file-based transfers) ---
 
     def _start_rsync_daemon(self, location: Location, unique_id: str) -> dict:
@@ -696,28 +1277,15 @@ exit $COPY_EXIT
         Returns dict with cleanup info and 'malai_id' for P2P connection.
         """
         if self.dry_run:
-            subpath = ''
-            if location.scheme in ('docker-volume', 'directory'):
-                parts = location.path.split('/', 1)
-                subpath = '/' + parts[1] if len(parts) > 1 else ''
-            elif location.scheme == 'k8s-pvc':
-                parts = location.path.split('/', 2)
-                subpath = '/' + parts[2] if len(parts) > 2 else ''
             print(f"[DRY RUN] Would start rsync-p2p daemon on {location.host} for {location.scheme}:{location.path}")
             return {
                 'type': 'dry-run',
                 'malai_id': 'dry-run-id',
-                'subpath': subpath
+                'subpath': location.subpath
             }
 
         if location.scheme in ('docker-volume', 'directory'):
-            if location.scheme == 'docker-volume':
-                parts = location.path.split('/', 1)
-                volume_mount = f"-v {parts[0]}:/data:ro"
-                subpath = '/' + parts[1] if len(parts) > 1 else ''
-            else:
-                volume_mount = f"-v {location.path}:/data:ro"
-                subpath = ''
+            volume_mount = location.docker_volume_arg('/data', read_only=True)
 
             container_name = f"rsync-daemon-{unique_id}"
             start_cmd = (
@@ -738,52 +1306,30 @@ exit $COPY_EXIT
                 'name': container_name,
                 'host': location.host,
                 'malai_id': malai_id,
-                'subpath': subpath
+                'subpath': location.subpath
             }
 
         elif location.scheme == 'k8s-pvc':
-            parts = location.path.split('/', 2)
-            namespace = parts[0]
-            pvc = parts[1]
-            subpath = '/' + parts[2] if len(parts) > 2 else ''
-
             pod_name = f"rsync-daemon-{unique_id}"
             context = self.get_k8s_context(location.host)
 
-            pod_spec = {
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "name": pod_name,
-                    "namespace": namespace
-                },
-                "spec": {
-                    "containers": [{
-                        "name": "rsync-p2p-server",
-                        "image": self.TRANSFER_P2P_IMAGE,
-                        "imagePullPolicy": "Always",
-                        "args": ["rsync", "server"],
-                        "env": [{"name": "QUIET", "value": "true"}],
-                        "volumeMounts": [{
-                            "name": "data",
-                            "mountPath": "/data",
-                            "readOnly": True
-                        }]
-                    }],
-                    "volumes": [{
-                        "name": "data",
-                        "persistentVolumeClaim": {
-                            "claimName": pvc
-                        }
-                    }],
-                    "restartPolicy": "Never"
-                }
-            }
+            node = self._find_node_for_pvc(context, location.namespace, location.pvc_name)
+            se_linux_level = self._find_selinux_level_for_pvc(context, location.namespace, location.pvc_name)
+            pod_spec = self._make_pvc_pod_spec(
+                pod_name, location.namespace, location.pvc_name,
+                container_name="rsync-p2p-server",
+                image=self.TRANSFER_P2P_IMAGE,
+                args=["rsync", "server"],
+                env=[{"name": "QUIET", "value": "true"}],
+                read_only=True,
+                node_name=node,
+                se_linux_level=se_linux_level,
+            )
 
-            node = self._find_node_for_pvc(context, namespace, pvc)
             if node:
-                pod_spec["spec"]["nodeName"] = node
-                print(f"  📌 Pinning daemon pod to node {node} (co-locating with PVC {pvc})")
+                print(f"  📌 Pinning daemon pod to node {node} (co-locating with PVC {location.pvc_name})")
+            if se_linux_level:
+                print(f"  🔒 Using SELinux level {se_linux_level} (matching existing pod on PVC)")
 
             print(f"  🚀 Starting rsync-p2p daemon pod (Malai P2P) in K8s...")
 
@@ -796,9 +1342,7 @@ exit $COPY_EXIT
             )
             time.sleep(2)
 
-            logs_cmd = f"logs {pod_name} -n {namespace}"
-            result = self.execute_kubectl(context, logs_cmd)
-
+            result = self.execute_kubectl(context, f"logs {pod_name} -n {location.namespace}")
             malai_id = self._require_malai_id(result.stdout, f"K8s pod {pod_name}")
 
             if self.debug:
@@ -807,10 +1351,10 @@ exit $COPY_EXIT
             return {
                 'type': 'k8s-p2p',
                 'name': pod_name,
-                'namespace': namespace,
+                'namespace': location.namespace,
                 'context': context,
                 'malai_id': malai_id,
-                'subpath': subpath
+                'subpath': location.subpath
             }
         else:
             raise ValueError(f"Unsupported scheme for rsync daemon: {location.scheme}")
@@ -826,7 +1370,8 @@ exit $COPY_EXIT
         target: Location,
         malai_connection: dict,
         unique_id: str,
-        exclude: Optional[List[str]] = None
+        exclude: Optional[List[str]] = None,
+        post_sync_command: Optional[str] = None,
     ):
         """Run rsync-p2p client to pull from daemon via Malai P2P."""
         if self.dry_run:
@@ -840,22 +1385,24 @@ exit $COPY_EXIT
             print(f"[DEBUG] Note: Exclusions {exclude} not yet supported with rsync-p2p")
 
         if target.scheme in ('docker-volume', 'directory'):
-            if target.scheme == 'docker-volume':
-                parts = target.path.split('/', 1)
-                volume_mount = f"-v {parts[0]}:/data"
-                target_subpath = '/' + parts[1] if len(parts) > 1 else ''
-            else:
-                volume_mount = f"-v {target.path}:/data"
-                target_subpath = ''
+            volume_mount = target.docker_volume_arg('/data')
 
             container_name = f"rsync-client-{unique_id}"
             source_path = f"{source_subpath}/" if source_subpath else "/"
-            dest_path = f"/data{target_subpath}/"
+            dest_path = f"/data{target.subpath}/"
+
+            if post_sync_command:
+                entrypoint_args = (
+                    f"--entrypoint sh {self.TRANSFER_P2P_IMAGE} -c "
+                    f"'/usr/local/bin/entrypoint.sh rsync client {malai_id} {source_path} {dest_path} && {post_sync_command}'"
+                )
+            else:
+                entrypoint_args = f"{self.TRANSFER_P2P_IMAGE} rsync client {malai_id} {source_path} {dest_path}"
 
             client_cmd = (
                 f"docker run --pull always --name {container_name} "
                 f"{volume_mount} "
-                f"{self.TRANSFER_P2P_IMAGE} rsync client {malai_id} {source_path} {dest_path}"
+                f"{entrypoint_args}"
             )
 
             print(f"  🔄 Running rsync-p2p client (Malai P2P) on {target.host}...")
@@ -869,88 +1416,42 @@ exit $COPY_EXIT
             self._run_docker_with_cleanup(target.host, container_name, client_cmd)
 
         elif target.scheme == 'k8s-pvc':
-            parts = target.path.split('/', 2)
-            namespace = parts[0]
-            pvc = parts[1]
-            target_subpath = '/' + parts[2] if len(parts) > 2 else ''
-
             pod_name = f"rsync-client-{unique_id}"
             context = self.get_k8s_context(target.host)
 
             source_path = f"{source_subpath}/" if source_subpath else "/"
-            dest_path = f"/data{target_subpath}/"
+            dest_path = f"/data{target.subpath}/"
 
-            pod_spec = {
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "name": pod_name,
-                    "namespace": namespace
-                },
-                "spec": {
-                    "containers": [{
-                        "name": "rsync-p2p-client",
-                        "image": self.TRANSFER_P2P_IMAGE,
-                        "imagePullPolicy": "Always",
-                        "args": ["rsync", "client", malai_id, source_path, dest_path],
-                        "volumeMounts": [{
-                            "name": "data",
-                            "mountPath": "/data"
-                        }]
-                    }],
-                    "volumes": [{
-                        "name": "data",
-                        "persistentVolumeClaim": {
-                            "claimName": pvc
-                        }
-                    }],
-                    "restartPolicy": "Never"
-                }
-            }
+            if post_sync_command:
+                command = ["sh", "-c"]
+                args_list = [f"/usr/local/bin/entrypoint.sh rsync client {malai_id} {source_path} {dest_path} && {post_sync_command}"]
+            else:
+                command = None
+                args_list = ["rsync", "client", malai_id, source_path, dest_path]
 
-            node = self._find_node_for_pvc(context, namespace, pvc)
+            node = self._find_node_for_pvc(context, target.namespace, target.pvc_name)
+            se_linux_level = self._find_selinux_level_for_pvc(context, target.namespace, target.pvc_name)
+            pod_spec = self._make_pvc_pod_spec(
+                pod_name, target.namespace, target.pvc_name,
+                container_name="rsync-p2p-client",
+                image=self.TRANSFER_P2P_IMAGE,
+                command=command,
+                args=args_list,
+                node_name=node,
+                se_linux_level=se_linux_level,
+            )
+
             if node:
-                pod_spec["spec"]["nodeName"] = node
-                print(f"  📌 Pinning client pod to node {node} (co-locating with PVC {pvc})")
+                print(f"  📌 Pinning client pod to node {node} (co-locating with PVC {target.pvc_name})")
+            if se_linux_level:
+                print(f"  🔒 Using SELinux level {se_linux_level} (matching existing pod on PVC)")
 
             print(f"  🔄 Running rsync-p2p client pod (Malai P2P) in K8s...")
             if self.debug:
                 print(f"[DEBUG] Malai ID: {malai_id}")
 
-            self._kubectl_apply_spec(context, pod_spec)
-
             print(f"  ⏳ Waiting for rsync-p2p client to complete...")
-            wait_cmd = f"wait --for=jsonpath='{{.status.phase}}'=Succeeded pod/{pod_name} -n {namespace} --timeout=300s"
-            pod_succeeded = False
-            try:
-                self.execute_kubectl(context, wait_cmd)
-                pod_succeeded = True
-            except subprocess.CalledProcessError:
-                status_cmd = f"get pod/{pod_name} -n {namespace} -o jsonpath='{{.status.phase}}'"
-                result = self.execute_kubectl(context, status_cmd)
-                pod_phase = result.stdout.strip()
-                if pod_phase == 'Succeeded':
-                    pod_succeeded = True
-
-            if not pod_succeeded or self.debug:
-                logs_cmd = f"logs {pod_name} -n {namespace}"
-                try:
-                    result = self.execute_kubectl(context, logs_cmd)
-                    label = "Rsync-p2p client logs" if not pod_succeeded else "[DEBUG] Rsync-p2p output"
-                    print(f"  {label}:\n{result.stdout}")
-                    if result.stderr:
-                        print(f"  stderr:\n{result.stderr}")
-                except Exception as log_err:
-                    print(f"  Failed to fetch pod logs: {log_err}")
-
-            delete_cmd = f"delete pod {pod_name} -n {namespace} --force --grace-period=0"
-            try:
-                self.execute_kubectl(context, delete_cmd)
-            except Exception as cleanup_err:
-                print(f"  Failed to cleanup rsync client pod: {cleanup_err}")
-
-            if not pod_succeeded:
-                raise Exception(f"Rsync client pod failed with status: {pod_phase}")
+            self._run_k8s_pod_to_completion(context, pod_spec, timeout=300)
 
         else:
             raise ValueError(f"Unsupported scheme for rsync client: {target.scheme}")
@@ -1068,45 +1569,21 @@ exit $COPY_EXIT
             pvc_namespace, pvc_name = volume_identifier.split('/', 1)
             pod_name = f"pg-dump-{unique_id}"
 
-            pod_spec = {
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "name": pod_name,
-                    "namespace": pvc_namespace
-                },
-                "spec": {
-                    "containers": [{
-                        "name": "pg-dump",
-                        "image": "postgres:alpine",
-                        "imagePullPolicy": "Always",
-                        "command": ["sh", "-c"],
-                        "args": [f"pg_dump -h {pod}.{namespace}.svc.cluster.local -U {source.username} -Fc -f {dump_file} {source.path}"],
-                        "env": [{"name": "PGPASSWORD", "value": source.password or ""}],
-                        "volumeMounts": [{
-                            "name": "dump",
-                            "mountPath": "/dump"
-                        }]
-                    }],
-                    "volumes": [{
-                        "name": "dump",
-                        "persistentVolumeClaim": {"claimName": pvc_name}
-                    }],
-                    "restartPolicy": "Never"
-                }
-            }
-
-            self._kubectl_apply_spec(context, pod_spec)
+            pod_spec = self._make_pvc_pod_spec(
+                pod_name, pvc_namespace, pvc_name,
+                container_name="pg-dump",
+                image="postgres:alpine",
+                command=["sh", "-c"],
+                args=[f"pg_dump -h {pod}.{namespace}.svc.cluster.local -U {source.username} -Fc -f {dump_file} {source.path}"],
+                env=[{"name": "PGPASSWORD", "value": source.password or ""}],
+                mount_path="/dump",
+            )
 
             print(f"  ⏳ Waiting for pg_dump to complete...")
-            wait_cmd = f"wait --for=jsonpath='{{.status.phase}}'=Succeeded pod/{pod_name} -n {pvc_namespace} --timeout=600s"
-            self.execute_kubectl(context, wait_cmd)
-
-            self.execute_kubectl(context, f"delete pod {pod_name} -n {pvc_namespace} --force --grace-period=0")
+            self._run_k8s_pod_to_completion(context, pod_spec, timeout=600)
         else:
             container_name = f"pg-dump-{unique_id}"
-            pull_cmd = f"docker pull postgres:alpine"
-            self.execute_on_host(source.host, pull_cmd)
+            self.execute_on_host(source.host, "docker pull postgres:alpine")
 
             start_cmd = (
                 f"docker run -d --name {container_name} "
@@ -1116,15 +1593,7 @@ exit $COPY_EXIT
                 f"postgres:alpine "
                 f"pg_dump -h localhost -U {source.username} -Fc -f {dump_file} {source.path}"
             )
-            self.execute_on_host(source.host, start_cmd)
-
-            wait_result = self.execute_on_host(source.host, f"docker wait {container_name}")
-            exit_code = wait_result.stdout.strip()
-            if exit_code != '0':
-                logs = self.execute_on_host(source.host, f"docker logs {container_name}")
-                self.execute_on_host(source.host, f"docker rm -f {container_name}")
-                raise Exception(f"pg_dump container exited with code {exit_code}: {logs.stdout}")
-            self.execute_on_host(source.host, f"docker rm -f {container_name}")
+            self._run_docker_to_completion(source.host, container_name, start_cmd)
 
         print(f"  ✅ pg_dump completed")
 
@@ -1143,50 +1612,21 @@ exit $COPY_EXIT
             pvc_namespace, pvc_name = volume_identifier.split('/', 1)
             pod_name = f"pg-restore-{unique_id}"
 
-            pod_spec = {
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {
-                    "name": pod_name,
-                    "namespace": pvc_namespace
-                },
-                "spec": {
-                    "containers": [{
-                        "name": "pg-restore",
-                        "image": "postgres:alpine",
-                        "imagePullPolicy": "Always",
-                        "command": ["sh", "-c"],
-                        "args": [f"pg_restore -h {pod}.{namespace}.svc.cluster.local -U {target.username} -j4 --no-owner --clean -d {target.path} {dump_file} 2>&1 | grep -v 'transaction_timeout' || true"],
-                        "env": [{"name": "PGPASSWORD", "value": target.password or ""}],
-                        "volumeMounts": [{
-                            "name": "dump",
-                            "mountPath": "/dump"
-                        }]
-                    }],
-                    "volumes": [{
-                        "name": "dump",
-                        "persistentVolumeClaim": {"claimName": pvc_name}
-                    }],
-                    "restartPolicy": "Never"
-                }
-            }
-
-            self._kubectl_apply_spec(context, pod_spec)
+            pod_spec = self._make_pvc_pod_spec(
+                pod_name, pvc_namespace, pvc_name,
+                container_name="pg-restore",
+                image="postgres:alpine",
+                command=["sh", "-c"],
+                args=[f"pg_restore -h {pod}.{namespace}.svc.cluster.local -U {target.username} -j4 --no-owner --clean -d {target.path} {dump_file} 2>&1 | grep -v 'transaction_timeout' || true"],
+                env=[{"name": "PGPASSWORD", "value": target.password or ""}],
+                mount_path="/dump",
+            )
 
             print(f"  ⏳ Waiting for pg_restore to complete...")
-            wait_cmd = f"wait --for=jsonpath='{{.status.phase}}'=Succeeded pod/{pod_name} -n {pvc_namespace} --timeout=600s"
-            self.execute_kubectl(context, wait_cmd)
-
-            if self.debug:
-                logs_cmd = f"logs {pod_name} -n {pvc_namespace}"
-                result = self.execute_kubectl(context, logs_cmd)
-                print(f"[DEBUG] pg_restore output: {result.stdout}")
-
-            self.execute_kubectl(context, f"delete pod {pod_name} -n {pvc_namespace} --force --grace-period=0")
+            self._run_k8s_pod_to_completion(context, pod_spec, timeout=600)
         else:
             container_name = f"pg-restore-{unique_id}"
-            pull_cmd = f"docker pull postgres:alpine"
-            self.execute_on_host(target.host, pull_cmd)
+            self.execute_on_host(target.host, "docker pull postgres:alpine")
 
             start_cmd = (
                 f"docker run -d --name {container_name} "
@@ -1196,15 +1636,7 @@ exit $COPY_EXIT
                 f"postgres:alpine "
                 f"sh -c \"pg_restore -h localhost -U {target.username} -j4 --no-owner --clean -d {target.path} {dump_file} 2>&1 | grep -v 'transaction_timeout' || true\""
             )
-            self.execute_on_host(target.host, start_cmd)
-
-            wait_result = self.execute_on_host(target.host, f"docker wait {container_name}")
-            exit_code = wait_result.stdout.strip()
-            if exit_code != '0':
-                logs = self.execute_on_host(target.host, f"docker logs {container_name}")
-                self.execute_on_host(target.host, f"docker rm -f {container_name}")
-                raise Exception(f"pg_restore container exited with code {exit_code}: {logs.stdout}")
-            self.execute_on_host(target.host, f"docker rm -f {container_name}")
+            self._run_docker_to_completion(target.host, container_name, start_cmd)
 
         print(f"  ✅ pg_restore completed")
 
@@ -1214,7 +1646,8 @@ exit $COPY_EXIT
         self,
         source: Location,
         target: Location,
-        exclude: Optional[List[str]] = None
+        exclude: Optional[List[str]] = None,
+        post_sync_command: Optional[str] = None,
     ):
         """Universal incremental transfer using rsync-p2p with Malai P2P."""
         print(f"🔄 Transferring via rsync-p2p (Malai P2P): {source.scheme}:{source.path} → {target.scheme}:{target.path}")
@@ -1228,7 +1661,7 @@ exit $COPY_EXIT
             malai_connection = self._get_malai_connection_info(daemon_info)
             print(f"  📡 Malai P2P ID: {malai_connection['malai_id']}")
 
-            self._run_rsync_client(target, malai_connection, unique_id, exclude)
+            self._run_rsync_client(target, malai_connection, unique_id, exclude, post_sync_command)
 
             print("  ✅ Rsync-p2p (Malai P2P) transfer completed successfully")
 
@@ -1304,8 +1737,14 @@ exit $COPY_EXIT
         """Route transfer to appropriate handler based on source/target types."""
         transfer_key = f"{source.scheme}->{target.scheme}"
 
+        if transfer_key == 'weaviate->weaviate':
+            if source.volume_type and target.volume_type:
+                self.transfer_weaviate_backup_restore(source, target, exclude)
+            else:
+                self.transfer_weaviate_to_weaviate(source, target, exclude)
+            return
+
         specialized_handlers = {
-            'weaviate->weaviate': self.transfer_weaviate_to_weaviate,
             'postgres->postgres': self.transfer_postgres_to_postgres,
         }
 
