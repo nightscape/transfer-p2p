@@ -1392,8 +1392,9 @@ exit $COPY_EXIT
         malai_id = malai_connection['malai_id']
         source_subpath = malai_connection.get('subpath', '')
 
-        if exclude and self.debug:
-            print(f"[DEBUG] Note: Exclusions {exclude} not yet supported with rsync-p2p")
+        exclude_flags = [f"--exclude={e}" for e in exclude] if exclude else []
+        if exclude_flags and self.debug:
+            print(f"[DEBUG] Rsync exclusions: {exclude_flags}")
 
         if target.scheme in ('docker-volume', 'directory'):
             volume_mount = target.docker_volume_arg('/data')
@@ -1402,13 +1403,14 @@ exit $COPY_EXIT
             source_path = f"{source_subpath}/" if source_subpath else "/"
             dest_path = f"/data{target.subpath}/"
 
+            exclude_str = ' '.join(shlex.quote(f) for f in exclude_flags)
             if post_sync_command:
                 entrypoint_args = (
                     f"--entrypoint sh {self.TRANSFER_P2P_IMAGE} -c "
-                    f"'/usr/local/bin/entrypoint.sh rsync client {malai_id} {source_path} {dest_path} && {post_sync_command}'"
+                    f"'/usr/local/bin/entrypoint.sh rsync client {malai_id} {source_path} {dest_path} {exclude_str} && {post_sync_command}'"
                 )
             else:
-                entrypoint_args = f"{self.TRANSFER_P2P_IMAGE} rsync client {malai_id} {source_path} {dest_path}"
+                entrypoint_args = f"{self.TRANSFER_P2P_IMAGE} rsync client {malai_id} {source_path} {dest_path} {exclude_str}"
 
             client_cmd = (
                 f"docker run --pull always --name {container_name} "
@@ -1433,12 +1435,13 @@ exit $COPY_EXIT
             source_path = f"{source_subpath}/" if source_subpath else "/"
             dest_path = f"/data{target.subpath}/"
 
+            exclude_str = ' '.join(exclude_flags)
             if post_sync_command:
                 command = ["sh", "-c"]
-                args_list = [f"/usr/local/bin/entrypoint.sh rsync client {malai_id} {source_path} {dest_path} && {post_sync_command}"]
+                args_list = [f"/usr/local/bin/entrypoint.sh rsync client {malai_id} {source_path} {dest_path} {exclude_str} && {post_sync_command}"]
             else:
                 command = None
-                args_list = ["rsync", "client", malai_id, source_path, dest_path]
+                args_list = ["rsync", "client", malai_id, source_path, dest_path] + exclude_flags
 
             node = self._find_node_for_pvc(context, target.namespace, target.pvc_name)
             se_linux_level = self._find_selinux_level_for_pvc(context, target.namespace, target.pvc_name)

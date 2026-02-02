@@ -39,10 +39,13 @@ rsync Mode:
                           PORT defaults to 873 (rsync default)
                           --quiet outputs only MALAI_ID=<id> for machine parsing
 
-  client <ID> <SRC> <DEST>  Connect to rsync daemon via Malai TCP bridge
+  client <ID> <SRC> <DEST> [RSYNC_ARGS...]
+                          Connect to rsync daemon via Malai TCP bridge
                           ID: Malai identifier from server
                           SRC: Source path
                           DEST: Destination path
+                          Extra args are passed directly to rsync
+                          (e.g. --exclude='*.log' --exclude='cache/*')
 
 weaviate Mode:
   server <URL> [--quiet]   Expose Weaviate via Malai P2P tunnel
@@ -276,6 +279,8 @@ run_client() {
     local malai_id="$1"
     local src="$2"
     local dest="$3"
+    shift 3
+    local extra_args=("$@")
     local bridge_port="${BRIDGE_PORT:-8873}"
 
     if [ -z "$malai_id" ] || [ -z "$src" ] || [ -z "$dest" ]; then
@@ -310,11 +315,11 @@ run_client() {
     [ "$QUIET" != "true" ] && echo "📦 Syncing files from ${src} to ${dest}..." >&2
     [ "$QUIET" != "true" ] && echo "" >&2
 
-    # Run rsync through the bridge
+    # Run rsync through the bridge (extra_args forwarded directly to rsync)
     if [ "$QUIET" = "true" ]; then
-        rsync -az --port="${bridge_port}" "rsync://localhost/data${src}" "${dest}"
+        rsync -az --port="${bridge_port}" "${extra_args[@]}" "rsync://localhost/data${src}" "${dest}"
     else
-        rsync -avz --port="${bridge_port}" "rsync://localhost/data${src}" "${dest}"
+        rsync -avz --port="${bridge_port}" "${extra_args[@]}" "rsync://localhost/data${src}" "${dest}"
     fi
     RSYNC_EXIT=$?
 
@@ -362,7 +367,8 @@ case "$MODE" in
                 run_server "$3"
                 ;;
             client)
-                run_client "$3" "$4" "$5"
+                shift 2
+                run_client "$@"
                 ;;
             help|--help|-h)
                 show_help
