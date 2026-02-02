@@ -250,11 +250,12 @@ class TransferEngine:
 
     TRANSFER_P2P_IMAGE = "ghcr.io/nightscape/transfer-p2p:main"
 
-    def __init__(self, from_host: str, to_host: str, dry_run: bool = False, debug: bool = False):
+    def __init__(self, from_host: str, to_host: str, dry_run: bool = False, debug: bool = False, timeout: int = 300):
         self.from_host = from_host
         self.to_host = to_host
         self.dry_run = dry_run
         self.debug = debug
+        self.timeout = timeout
 
     # --- Helpers ---
 
@@ -440,8 +441,10 @@ class TransferEngine:
             }
         return spec
 
-    def _run_k8s_pod_to_completion(self, context: str, pod_spec: dict, timeout: int = 300) -> Optional[str]:
+    def _run_k8s_pod_to_completion(self, context: str, pod_spec: dict, timeout: Optional[int] = None) -> Optional[str]:
         """Apply pod, wait for Succeeded, return logs, cleanup. Raises on failure."""
+        if timeout is None:
+            timeout = self.timeout
         name = pod_spec['metadata']['name']
         ns = pod_spec['metadata']['namespace']
 
@@ -1047,8 +1050,10 @@ exit $COPY_EXIT
 
     # --- Weaviate backup/restore transfer ---
 
-    def _weaviate_poll_status(self, api_fn, endpoint: str, timeout: int = 300) -> str:
+    def _weaviate_poll_status(self, api_fn, endpoint: str, timeout: Optional[int] = None) -> str:
         """Poll a Weaviate backup status endpoint until SUCCESS or FAILED."""
+        if timeout is None:
+            timeout = self.timeout
         if self.dry_run:
             print(f"[DRY RUN] Would poll {endpoint} until SUCCESS")
             return "SUCCESS"
@@ -1451,7 +1456,7 @@ exit $COPY_EXIT
                 print(f"[DEBUG] Malai ID: {malai_id}")
 
             print(f"  ⏳ Waiting for rsync-p2p client to complete...")
-            self._run_k8s_pod_to_completion(context, pod_spec, timeout=300)
+            self._run_k8s_pod_to_completion(context, pod_spec)
 
         else:
             raise ValueError(f"Unsupported scheme for rsync client: {target.scheme}")
@@ -1580,7 +1585,7 @@ exit $COPY_EXIT
             )
 
             print(f"  ⏳ Waiting for pg_dump to complete...")
-            self._run_k8s_pod_to_completion(context, pod_spec, timeout=600)
+            self._run_k8s_pod_to_completion(context, pod_spec)
         else:
             container_name = f"pg-dump-{unique_id}"
             self.execute_on_host(source.host, "docker pull postgres:alpine")
@@ -1623,7 +1628,7 @@ exit $COPY_EXIT
             )
 
             print(f"  ⏳ Waiting for pg_restore to complete...")
-            self._run_k8s_pod_to_completion(context, pod_spec, timeout=600)
+            self._run_k8s_pod_to_completion(context, pod_spec)
         else:
             container_name = f"pg-restore-{unique_id}"
             self.execute_on_host(target.host, "docker pull postgres:alpine")
@@ -1779,6 +1784,8 @@ def main():
         metavar='PATTERNS',
         help='Comma-separated exclusion patterns (e.g., "*.temp,*.log")'
     )
+    parser.add_argument('--timeout', type=int, default=300, metavar='SECONDS',
+                        help='Timeout in seconds for long-running operations (default: 300)')
     parser.add_argument('--dry-run', action='store_true', help='Show what would be done without doing it')
     parser.add_argument('--debug', action='store_true', help='Print additional debug information')
 
@@ -1796,7 +1803,7 @@ def main():
     exclusions = args.exclude.split(',') if args.exclude else None
 
     logger.debug("Creating TransferEngine")
-    engine = TransferEngine(args.from_host, args.to_host, dry_run=args.dry_run, debug=args.debug)
+    engine = TransferEngine(args.from_host, args.to_host, dry_run=args.dry_run, debug=args.debug, timeout=args.timeout)
     logger.debug("TransferEngine created")
 
     print("🚀 Data Transfer Tool")
