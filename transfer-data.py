@@ -357,11 +357,17 @@ class TransferEngine:
         return pod, namespace
 
     def _start_docker_get_malai_id(self, host: str, start_cmd: str, container_name: str) -> str:
-        """Start a Docker container and extract its MALAI_ID from logs."""
+        """Start a Docker container and poll logs until MALAI_ID appears."""
         self.execute_on_host(host, start_cmd)
-        time.sleep(3)
-        result = self.execute_on_host(host, f"docker logs {container_name}")
-        return self._require_malai_id(result.stdout, f"container {container_name}")
+        for attempt in range(90):
+            time.sleep(2)
+            result = self.execute_on_host(host, f"docker logs {container_name}")
+            malai_id = self._parse_malai_id(result.stdout)
+            if malai_id:
+                if self.debug:
+                    print(f"[DEBUG] Got Malai ID: {malai_id}")
+                return malai_id
+        raise Exception(f"Timed out waiting for Malai ID from container {container_name}. Logs: {result.stdout}")
 
     def _log_docker_container(self, host: str, container_name: str):
         try:
@@ -1351,10 +1357,17 @@ exit $COPY_EXIT
                 context,
                 f"wait --for=jsonpath='{{.status.phase}}'=Running pod/{pod_name} -n {location.namespace} --timeout=120s",
             )
-            time.sleep(2)
 
-            result = self.execute_kubectl(context, f"logs {pod_name} -n {location.namespace}")
-            malai_id = self._require_malai_id(result.stdout, f"K8s pod {pod_name}")
+            print(f"  ⏳ Waiting for Malai P2P tunnel to establish...")
+            malai_id = None
+            for attempt in range(90):
+                time.sleep(2)
+                result = self.execute_kubectl(context, f"logs {pod_name} -n {location.namespace}")
+                malai_id = self._parse_malai_id(result.stdout)
+                if malai_id:
+                    break
+            if not malai_id:
+                raise Exception(f"Timed out waiting for Malai ID from K8s pod {pod_name}. Logs: {result.stdout}")
 
             if self.debug:
                 print(f"[DEBUG] Got Malai ID from K8s pod: {malai_id}")
