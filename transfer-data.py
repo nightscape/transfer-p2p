@@ -375,13 +375,10 @@ class TransferEngine:
     def _run_docker_with_cleanup(self, host: str, container_name: str, run_cmd: str):
         """Run a Docker container, show logs on debug/failure, always cleanup."""
         try:
-            self.execute_on_host(host, run_cmd)
-            if self.debug:
-                self._log_docker_container(host, container_name)
+            self.execute_on_host(host, run_cmd, stream=self.debug)
         except subprocess.CalledProcessError as e:
             if self.debug:
                 print(f"[DEBUG] Container {container_name} failed with exit code {e.returncode}")
-                self._log_docker_container(host, container_name)
             raise
         finally:
             try:
@@ -450,6 +447,15 @@ class TransferEngine:
 
         self._kubectl_apply_spec(context, pod_spec)
 
+        if self.debug:
+            # Wait for container to start before streaming logs (avoids ContainerCreating race)
+            try:
+                self.execute_kubectl(context, f"wait --for=jsonpath='{{.status.phase}}'=Running pod/{name} -n {ns} --timeout=120s")
+            except subprocess.CalledProcessError:
+                pass  # Pod may have already completed or failed to start
+            stream_cmd = f"kubectl --context={context} logs -f {name} -n {ns}"
+            subprocess.run(stream_cmd, shell=True, check=False)
+
         wait_cmd = f"wait --for=jsonpath='{{.status.phase}}'=Succeeded pod/{name} -n {ns} --timeout={timeout}s"
         succeeded = False
         try:
@@ -457,16 +463,15 @@ class TransferEngine:
             succeeded = True
         except subprocess.CalledProcessError:
             result = self.execute_kubectl(context, f"get pod/{name} -n {ns} -o jsonpath='{{.status.phase}}'")
-            if result.stdout.strip() == 'Succeeded':
+            if result.stdout.strip().strip("'") == 'Succeeded':
                 succeeded = True
 
         logs = None
-        if not succeeded or self.debug:
+        if not succeeded:
             try:
                 result = self.execute_kubectl(context, f"logs {name} -n {ns}")
                 logs = result.stdout
-                if self.debug:
-                    print(f"  [DEBUG] Pod {name} output:\n{logs}")
+                print(f"  Pod {name} output:\n{logs}")
                 if result.stderr:
                     print(f"  stderr:\n{result.stderr}")
             except Exception as e:
@@ -673,7 +678,7 @@ class TransferEngine:
     def get_k8s_context(self, host: str) -> str:
         return host.replace('k8s:', '')
 
-    def execute_on_host(self, host: str, command: str) -> subprocess.CompletedProcess:
+    def execute_on_host(self, host: str, command: str, stream: bool = False) -> subprocess.CompletedProcess:
         if self.dry_run:
             print(f"[DRY RUN] Would execute on {host}: {command}")
             return subprocess.CompletedProcess(args=[], returncode=0, stdout='', stderr='')
@@ -685,17 +690,17 @@ class TransferEngine:
         max_attempts = 5 if is_ssh else 1
 
         for attempt in range(1, max_attempts + 1):
+            capture_kwargs = {} if stream else {"capture_output": True, "text": True}
             if self.is_localhost(host):
-                result = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)
+                result = subprocess.run(command, shell=True, check=False, **capture_kwargs)
             else:
                 result = subprocess.run(
                     ['ssh', host, command],
-                    capture_output=True,
-                    text=True,
-                    check=False
+                    check=False,
+                    **capture_kwargs
                 )
 
-            if self.debug:
+            if self.debug and not stream:
                 print(f"[DEBUG] Command exit code: {result.returncode}")
                 if result.stdout:
                     print(f"[DEBUG] stdout: {result.stdout[:500]}")
@@ -713,10 +718,11 @@ class TransferEngine:
                 continue
 
             print(f"  Command failed (exit {result.returncode}) on {host}: {command}")
-            if result.stdout:
-                print(f"  stdout: {result.stdout[:2000]}")
-            if result.stderr:
-                print(f"  stderr: {result.stderr[:2000]}")
+            if not stream:
+                if result.stdout:
+                    print(f"  stdout: {result.stdout[:2000]}")
+                if result.stderr:
+                    print(f"  stderr: {result.stderr[:2000]}")
             raise subprocess.CalledProcessError(
                 result.returncode, result.args, result.stdout, result.stderr
             )
@@ -1442,6 +1448,7 @@ exit $COPY_EXIT
                 image=self.TRANSFER_P2P_IMAGE,
                 command=command,
                 args=args_list,
+                env=[{"name": "QUIET", "value": str(not self.debug).lower()}],
                 node_name=node,
                 se_linux_level=se_linux_level,
             )
