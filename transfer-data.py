@@ -88,7 +88,7 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 logger = logging.getLogger(__name__)
 
@@ -202,8 +202,8 @@ class Location:
                 scheme='postgres',
                 host=default_host,
                 path=database,
-                username=parsed.username,
-                password=parsed.password,
+                username=unquote(parsed.username) if parsed.username else None,
+                password=unquote(parsed.password) if parsed.password else None,
                 port=parsed.port or 5432,
                 service_name=parsed.hostname
             )
@@ -458,9 +458,18 @@ class TransferEngine:
             try:
                 self.execute_kubectl(context, f"wait --for=jsonpath='{{.status.phase}}'=Running pod/{name} -n {ns} --timeout=120s")
             except subprocess.CalledProcessError:
-                pass  # Pod may have already completed or failed to start
-            stream_cmd = f"kubectl --context={context} logs -f {name} -n {ns}"
-            subprocess.run(stream_cmd, shell=True, check=False)
+                # Pod may have already completed or failed to start — check before streaming
+                result = self.execute_kubectl(context, f"get pod/{name} -n {ns} -o jsonpath='{{.status.phase}}'")
+                phase = result.stdout.strip().strip("'")
+                if phase != 'Running':
+                    print(f"[DEBUG] Pod {name} is in phase '{phase}', skipping log streaming")
+                    if phase in ('Failed', 'Succeeded'):
+                        result = self.execute_kubectl(context, f"logs {name} -n {ns}")
+                        if result.stdout.strip():
+                            print(result.stdout)
+            else:
+                stream_cmd = f"kubectl --context={context} logs -f {name} -n {ns}"
+                subprocess.run(stream_cmd, shell=True, check=False)
 
         wait_cmd = f"wait --for=jsonpath='{{.status.phase}}'=Succeeded pod/{name} -n {ns} --timeout={timeout}s"
         succeeded = False
@@ -1515,20 +1524,23 @@ exit $COPY_EXIT
 
     # --- Postgres transfer ---
 
-    def _create_temp_volume(self, location: Location, unique_id: str) -> str:
+    def _create_temp_volume(self, location: Location, unique_id: str, namespace_override: Optional[str] = None) -> str:
         volume_name = f"pg-dump-{unique_id}"
 
         if self.dry_run:
             if self.is_k8s_context(location.host):
-                print(f"[DRY RUN] Would create temporary PVC: default/{volume_name}")
-                return f"default/{volume_name}"
+                ns = namespace_override or 'default'
+                print(f"[DRY RUN] Would create temporary PVC: {ns}/{volume_name}")
+                return f"{ns}/{volume_name}"
             else:
                 print(f"[DRY RUN] Would create temporary Docker volume: {volume_name}")
                 return volume_name
 
         if self.is_k8s_context(location.host):
             context = self.get_k8s_context(location.host)
-            if '/' in location.host:
+            if namespace_override:
+                namespace = namespace_override
+            elif '/' in location.host:
                 namespace, _ = location.host.split('/', 1)
             else:
                 namespace = 'default'
@@ -1582,6 +1594,35 @@ exit $COPY_EXIT
                 if self.debug:
                     print(f"[DEBUG] Failed to cleanup volume: {e}")
 
+    def _k8s_env_entry(self, env_name: str, value: Optional[str]) -> dict:
+        """Build a K8s env entry. If value starts with 'k8s-secret:', use a
+        secretKeyRef in the format 'k8s-secret:<secret-name>:<key>'.
+        Otherwise use a plain value.
+        """
+        val = value or ""
+        if val.startswith("k8s-secret:"):
+            parts = val.split(":", 2)
+            assert len(parts) == 3, f"Expected 'k8s-secret:<name>:<key>', got: {val}"
+            return {"name": env_name, "valueFrom": {
+                "secretKeyRef": {"name": parts[1], "key": parts[2]}
+            }}
+        return {"name": env_name, "value": val}
+
+    def _pg_env(self, location: Location) -> list:
+        """Build PGPASSWORD and optionally PGUSER env entries for a postgres location."""
+        env = [self._k8s_env_entry("PGPASSWORD", location.password)]
+        if location.username and location.username.startswith("k8s-secret:"):
+            env.append(self._k8s_env_entry("PGUSER", location.username))
+        return env
+
+    def _pg_user_arg(self, location: Location) -> str:
+        """Return the -U argument for pg_dump/pg_restore.
+        If the username is a k8s-secret ref, use $PGUSER (resolved from env).
+        """
+        if location.username and location.username.startswith("k8s-secret:"):
+            return "$PGUSER"
+        return location.username or "postgres"
+
     def _pg_dump_to_volume(self, source: Location, volume_identifier: str, unique_id: str):
         if self.dry_run:
             print(f"[DRY RUN] Would run pg_dump from {source.service_name} to volume {volume_identifier}")
@@ -1602,8 +1643,8 @@ exit $COPY_EXIT
                 container_name="pg-dump",
                 image="postgres:alpine",
                 command=["sh", "-c"],
-                args=[f"pg_dump -h {pod}.{namespace}.svc.cluster.local -U {source.username} -Fc -f {dump_file} {source.path}"],
-                env=[{"name": "PGPASSWORD", "value": source.password or ""}],
+                args=[f"pg_dump -h {pod}.{namespace}.svc.cluster.local -U {self._pg_user_arg(source)} -Fc -f {dump_file} {source.path}"],
+                env=self._pg_env(source),
                 mount_path="/dump",
             )
 
@@ -1645,8 +1686,8 @@ exit $COPY_EXIT
                 container_name="pg-restore",
                 image="postgres:alpine",
                 command=["sh", "-c"],
-                args=[f"pg_restore -h {pod}.{namespace}.svc.cluster.local -U {target.username} -j4 --no-owner --clean -d {target.path} {dump_file} 2>&1 | grep -v 'transaction_timeout' || true"],
-                env=[{"name": "PGPASSWORD", "value": target.password or ""}],
+                args=[f"pg_restore -h {pod}.{namespace}.svc.cluster.local -U {self._pg_user_arg(target)} -j4 --no-owner --clean --if-exists -d {target.path} {dump_file}"],
+                env=self._pg_env(target),
                 mount_path="/dump",
             )
 
@@ -1662,7 +1703,7 @@ exit $COPY_EXIT
                 f"-v {volume_identifier}:/dump "
                 f"-e PGPASSWORD={target.password or ''} "
                 f"postgres:alpine "
-                f"sh -c \"pg_restore -h localhost -U {target.username} -j4 --no-owner --clean -d {target.path} {dump_file} 2>&1 | grep -v 'transaction_timeout' || true\""
+                f"sh -c \"pg_restore -h localhost -U {target.username} -j4 --no-owner --clean --if-exists -d {target.path} {dump_file}\""
             )
             self._run_docker_to_completion(target.host, container_name, start_cmd)
 
@@ -1716,15 +1757,19 @@ exit $COPY_EXIT
         daemon_info = None
 
         try:
+            # Parse postgres namespace so temp PVCs are co-located with the postgres pods
+            source_pg_ns = self._parse_postgres_service(source.service_name)[1] if self.is_k8s_context(source.host) else None
+            target_pg_ns = self._parse_postgres_service(target.service_name)[1] if self.is_k8s_context(target.host) else None
+
             logger.debug("Creating temp volume for source")
-            source_volume = self._create_temp_volume(source, unique_id)
+            source_volume = self._create_temp_volume(source, unique_id, namespace_override=source_pg_ns)
             logger.debug(f"Source volume created: {source_volume}")
 
             logger.debug("Running pg_dump")
             self._pg_dump_to_volume(source, source_volume, unique_id)
             logger.debug("pg_dump completed")
 
-            target_volume = self._create_temp_volume(target, unique_id)
+            target_volume = self._create_temp_volume(target, unique_id, namespace_override=target_pg_ns)
 
             if self.is_k8s_context(source.host):
                 namespace, pvc_name = source_volume.split('/', 1)
