@@ -521,7 +521,40 @@ class TransferEngine:
         assert len(parts) == 2, f"Expected namespace/pvc-name in volume_id, got: {location.volume_id}"
         return parts[0]
 
+    # SPIFFE-based Weaviate auth (preferred). The control pod runs
+    # spiffe-helper to fetch a JWT-SVID for audience "weaviate" and a curl
+    # sidecar that reads the JWT and makes the API calls. SPIFFE ID
+    # `spiffe://<trust-domain>/ns/<ns>/sa/weaviate-transfer-tool` must be
+    # in weaviate's admin_list (k8s/weaviate/weaviate.garden.yml).
+    WEAVIATE_TRANSFER_SA = "weaviate-transfer-tool"
+    SPIFFE_HELPER_IMAGE = "ghcr.io/spiffe/spiffe-helper:0.10.1"
+    WEAVIATE_CONTROL_CURL_IMAGE = "curlimages/curl:8.5.0"
+    SPIFFE_HELPER_CONF = (
+        'agent_address = "/spiffe-workload-api/spire-agent.sock"\n'
+        'cert_dir = "/jwt"\n'
+        'jwt_svids = [{ jwt_audience = "weaviate", jwt_svid_file_name = "weaviate.jwt" }]\n'
+    )
+
+    def _cluster_has_spiffe(self, context: str) -> bool:
+        """Return True iff the cluster has the spiffe-csi-driver installed.
+
+        Used to route Weaviate API auth: clusters with SPIRE use a
+        SPIFFE-identified control pod; clusters without it (currently
+        hetzner-dev, still on K3s) fall back to port-forward + the
+        static `weaviate-api-key` Secret.
+        """
+        result = subprocess.run(
+            f"kubectl --context={context} get csidriver csi.spiffe.io --no-headers",
+            shell=True, capture_output=True, text=True,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+
     def _fetch_k8s_weaviate_api_key(self, context: str, namespace: str) -> Optional[str]:
+        """Read the static weaviate-api-key Secret from a tenant namespace.
+
+        Used by the apikey fallback for clusters without SPIRE (hetzner-dev).
+        On SPIRE-equipped clusters, the SPIFFE path is taken and this is unused.
+        """
         import base64
         for key_name in ('key', 'api-key', 'apikey'):
             try:
@@ -616,27 +649,44 @@ class TransferEngine:
 
     @contextmanager
     def _k8s_weaviate_api(self, location: Location):
-        """Context manager yielding an api_call(method, endpoint, body=None) function for K8s-hosted Weaviate."""
+        """Dispatch K8s Weaviate API auth based on cluster capabilities.
+
+        SPIRE-equipped clusters use the SPIFFE control-pod path
+        (`_k8s_weaviate_api_spiffe`); clusters without SPIRE fall back to
+        the legacy port-forward + static weaviate-api-key path
+        (`_k8s_weaviate_api_apikey`). Detection is by presence of the
+        `csi.spiffe.io` CSIDriver.
+        """
+        context = self.get_k8s_context(location.host)
+        if self._cluster_has_spiffe(context):
+            with self._k8s_weaviate_api_spiffe(location) as api_call:
+                yield api_call
+        else:
+            with self._k8s_weaviate_api_apikey(location) as api_call:
+                yield api_call
+
+    @contextmanager
+    def _k8s_weaviate_api_apikey(self, location: Location):
+        """Legacy auth path: kubectl port-forward + bearer token from the
+        per-tenant `weaviate-api-key` Secret. Used on clusters without SPIRE."""
         context = self.get_k8s_context(location.host)
         namespace = self._resolve_weaviate_k8s_namespace(location)
         api_key = self._fetch_k8s_weaviate_api_key(context, namespace)
 
         local_port = self._find_free_port()
-
         svc_name = location.service_name
         svc_port = location.port
         fwd_cmd = f"kubectl --context={context} port-forward -n {namespace} svc/{svc_name} {local_port}:{svc_port}"
 
         if self.dry_run:
             def api_call(method: str, endpoint: str, body: dict = None) -> dict:
-                print(f"[DRY RUN] Would call Weaviate API: {method} {endpoint}")
+                print(f"[DRY RUN] Would call Weaviate API (apikey): {method} {endpoint}")
                 return {}
             yield api_call
             return
 
         if self.debug:
             print(f"[DEBUG] Starting port-forward: {fwd_cmd}")
-
         proc = subprocess.Popen(fwd_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(3)
 
@@ -648,10 +698,8 @@ class TransferEngine:
                 req.add_header("Content-Type", "application/json")
                 if api_key:
                     req.add_header("Authorization", f"Bearer {api_key}")
-
                 if self.debug:
                     print(f"[DEBUG] Weaviate API {method} {endpoint} via port-forward :{local_port}, has_api_key={bool(api_key)}")
-
                 try:
                     with urllib.request.urlopen(req, timeout=30) as resp:
                         resp_body = resp.read().decode()
@@ -661,11 +709,155 @@ class TransferEngine:
                 except urllib.error.HTTPError as e:
                     error_body = e.read().decode() if e.fp else ""
                     raise Exception(f"Weaviate API {method} {endpoint} returned HTTP {e.code}: {error_body}") from e
-
             yield api_call
         finally:
             proc.terminate()
             proc.wait(timeout=5)
+
+    @contextmanager
+    def _k8s_weaviate_api_spiffe(self, location: Location):
+        """SPIFFE auth path: spin up a transient control pod (spiffe-helper +
+        curl sidecar), fetch a JWT-SVID for audience "weaviate", and make
+        API calls via `kubectl exec` into the curl container."""
+        context = self.get_k8s_context(location.host)
+        namespace = self._resolve_weaviate_k8s_namespace(location)
+        svc_name = location.service_name
+        svc_port = location.port
+
+        if self.dry_run:
+            def api_call(method: str, endpoint: str, body: dict = None) -> dict:
+                print(f"[DRY RUN] Would call Weaviate API via SPIFFE control pod: {method} {endpoint}")
+                return {}
+            yield api_call
+            return
+
+        unique_id = self._generate_unique_id()
+        pod_name = f"weaviate-control-{unique_id}"
+        cm_name = f"weaviate-control-{unique_id}"
+
+        # 1. Ensure the SA exists (idempotent). The default ClusterSPIFFEID in
+        # spire-mgmt issues SPIFFE IDs based on ns + SA, so creating the SA
+        # is sufficient — no SPIRE-side registration needed.
+        self._kubectl_apply_spec(context, {
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {"name": self.WEAVIATE_TRANSFER_SA, "namespace": namespace},
+        })
+
+        # 2. ConfigMap holding spiffe-helper config.
+        self._kubectl_apply_spec(context, {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": cm_name, "namespace": namespace},
+            "data": {"helper.conf": self.SPIFFE_HELPER_CONF},
+        })
+
+        # 3. The control pod: spiffe-helper writes the JWT to /jwt/weaviate.jwt;
+        # the curl sidecar reads it and runs HTTP calls.
+        self._kubectl_apply_spec(context, {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": pod_name, "namespace": namespace,
+                         "labels": {"app": "weaviate-control", "transfer-id": unique_id}},
+            "spec": {
+                "serviceAccountName": self.WEAVIATE_TRANSFER_SA,
+                "restartPolicy": "Never",
+                # Both containers run as the same UID/GID so spiffe-helper's
+                # mode-0600 JWT file written to the shared `jwt` emptyDir is
+                # readable by the curl sidecar. 100:101 is curlimages/curl's
+                # default; spiffe-helper has no problem running as non-root
+                # and the SPIFFE Workload API socket is world-accessible.
+                "securityContext": {"runAsUser": 100, "runAsGroup": 101, "fsGroup": 101},
+                "containers": [
+                    {
+                        "name": "spiffe-helper",
+                        "image": self.SPIFFE_HELPER_IMAGE,
+                        "args": ["-config", "/etc/sh/helper.conf"],
+                        "volumeMounts": [
+                            {"name": "spiffe-workload-api", "mountPath": "/spiffe-workload-api", "readOnly": True},
+                            {"name": "jwt", "mountPath": "/jwt"},
+                            {"name": "helper-config", "mountPath": "/etc/sh", "readOnly": True},
+                        ],
+                    },
+                    {
+                        "name": "curl",
+                        "image": self.WEAVIATE_CONTROL_CURL_IMAGE,
+                        "command": ["sleep", "infinity"],
+                        "volumeMounts": [
+                            {"name": "jwt", "mountPath": "/jwt", "readOnly": True},
+                        ],
+                    },
+                ],
+                "volumes": [
+                    {"name": "spiffe-workload-api",
+                     "csi": {"driver": "csi.spiffe.io", "readOnly": True}},
+                    {"name": "jwt", "emptyDir": {"medium": "Memory"}},
+                    {"name": "helper-config", "configMap": {"name": cm_name}},
+                ],
+            },
+        })
+
+        if self.debug:
+            print(f"[DEBUG] Waiting for weaviate-control pod {pod_name} in {namespace}…")
+        self.execute_kubectl(
+            context,
+            f"wait --for=condition=Ready pod/{pod_name} -n {namespace} --timeout=60s"
+        )
+
+        # spiffe-helper writes the JWT shortly after start; poll for it.
+        for _ in range(30):
+            probe = subprocess.run(
+                f"kubectl --context={context} exec -n {namespace} {pod_name} -c curl -- "
+                f"sh -c 'test -s /jwt/weaviate.jwt'",
+                shell=True, capture_output=True, text=True,
+            )
+            if probe.returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            raise Exception(f"spiffe-helper never wrote /jwt/weaviate.jwt in pod {pod_name}")
+
+        try:
+            def api_call(method: str, endpoint: str, body: dict = None) -> dict:
+                url = f"http://{svc_name}:{svc_port}{endpoint}"
+                # Build the curl shell command inside the pod. The JWT is
+                # read inline so each call uses the most recent rotated SVID.
+                curl_cmd = (
+                    f'curl -sS --max-time 30 -w "\\n%{{http_code}}" -X {method} '
+                    f'-H "Content-Type: application/json" '
+                    f'-H "Authorization: Bearer $(cat /jwt/weaviate.jwt)" '
+                    f'{shlex.quote(url)}'
+                )
+                if body is not None:
+                    curl_cmd += f" -d {shlex.quote(json.dumps(body))}"
+
+                if self.debug:
+                    print(f"[DEBUG] Weaviate API {method} {endpoint} via SPIFFE control pod {pod_name}")
+
+                result = self.execute_kubectl(
+                    context,
+                    f"exec -n {namespace} {pod_name} -c curl -- sh -c {shlex.quote(curl_cmd)}"
+                )
+                # `curl -w` appends "\n<status>" to stdout. Split on the last newline.
+                stdout = result.stdout.rstrip("\n")
+                resp_body, _, status_line = stdout.rpartition("\n")
+                status_code = int(status_line.strip()) if status_line.strip().isdigit() else 0
+                if status_code < 200 or status_code >= 300:
+                    raise Exception(
+                        f"Weaviate API {method} {endpoint} returned HTTP {status_code}: {resp_body}"
+                    )
+                if not resp_body.strip():
+                    return {}
+                return json.loads(resp_body)
+
+            yield api_call
+        finally:
+            for kind_name in (f"pod/{pod_name}", f"configmap/{cm_name}"):
+                subprocess.run(
+                    f"kubectl --context={context} delete {kind_name} -n {namespace} "
+                    f"--ignore-not-found --wait=false",
+                    shell=True, capture_output=True,
+                )
 
     @contextmanager
     def _weaviate_api_context(self, location: Location):
@@ -1577,22 +1769,43 @@ exit $COPY_EXIT
         if self.dry_run:
             return
 
-        print(f"  🧹 Cleaning up temporary volume...")
+        print(f"  🧹 Cleaning up temporary volume {volume_identifier}...")
 
+        # Called from a finally block, so swallow exceptions to avoid masking
+        # the original error — but retry once and log loudly so leaks are visible
+        # and actionable, not buried in --debug output.
         if self.is_k8s_context(location.host):
             context = self.get_k8s_context(location.host)
             namespace, pvc_name = volume_identifier.split('/', 1)
-            try:
-                self.execute_kubectl(context, f"delete pvc {pvc_name} -n {namespace}")
-            except Exception as e:
-                if self.debug:
-                    print(f"[DEBUG] Failed to cleanup PVC: {e}")
+            cleanup_cmd = f"delete pvc {pvc_name} -n {namespace} --wait=false"
+            for attempt in (1, 2):
+                try:
+                    self.execute_kubectl(context, cleanup_cmd)
+                    return
+                except Exception as e:
+                    if attempt == 1:
+                        print(f"  ⚠️  Cleanup attempt {attempt} failed: {e}; retrying...")
+                        time.sleep(2)
+                    else:
+                        print(
+                            f"  ❌ LEAKED PVC {namespace}/{pvc_name} on context {context}. "
+                            f"Run manually: kubectl --context {context} -n {namespace} delete pvc {pvc_name}"
+                        )
         else:
-            try:
-                self.execute_on_host(location.host, f"docker volume rm {volume_identifier}")
-            except Exception as e:
-                if self.debug:
-                    print(f"[DEBUG] Failed to cleanup volume: {e}")
+            cleanup_cmd = f"docker volume rm {volume_identifier}"
+            for attempt in (1, 2):
+                try:
+                    self.execute_on_host(location.host, cleanup_cmd)
+                    return
+                except Exception as e:
+                    if attempt == 1:
+                        print(f"  ⚠️  Cleanup attempt {attempt} failed: {e}; retrying...")
+                        time.sleep(2)
+                    else:
+                        print(
+                            f"  ❌ LEAKED Docker volume {volume_identifier} on host {location.host}. "
+                            f"Run manually: ssh {location.host} docker volume rm {volume_identifier}"
+                        )
 
     def _k8s_env_entry(self, env_name: str, value: Optional[str]) -> dict:
         """Build a K8s env entry. If value starts with 'k8s-secret:', use a
