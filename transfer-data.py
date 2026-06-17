@@ -819,11 +819,15 @@ class TransferEngine:
 
         try:
             def api_call(method: str, endpoint: str, body: dict = None) -> dict:
-                url = f"http://{svc_name}:{svc_port}{endpoint}"
+                # envoy terminates TLS on the service port (server-only TLS, no
+                # client-cert verification — see k8s/weaviate/weaviate-mtls.garden.yml),
+                # so we speak https and skip server-cert verification with -k.
+                # Auth is the JWT-SVID bearer token, validated by weaviate's admin_list.
+                url = f"https://{svc_name}:{svc_port}{endpoint}"
                 # Build the curl shell command inside the pod. The JWT is
                 # read inline so each call uses the most recent rotated SVID.
                 curl_cmd = (
-                    f'curl -sS --max-time 30 -w "\\n%{{http_code}}" -X {method} '
+                    f'curl -sS -k --max-time 30 -w "\\n%{{http_code}}" -X {method} '
                     f'-H "Content-Type: application/json" '
                     f'-H "Authorization: Bearer $(cat /jwt/weaviate.jwt)" '
                     f'{shlex.quote(url)}'
