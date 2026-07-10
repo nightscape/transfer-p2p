@@ -20,6 +20,23 @@ Transfer Methods:
   - Weaviate: REST API-based object transfer with batch import
   - Postgres: pg_dump → rsync-p2p (Malai P2P) → pg_restore with NAT traversal
 
+Export (dump, no restore/import):
+  A Weaviate or Postgres SOURCE may target a file-based destination
+  (directory / docker-volume / k8s-pvc) instead of another datastore. The tool
+  then writes a restorable backup to that destination — reusing the same
+  Malai-P2P rsync transport, so the destination can live on any host — and
+  stops before importing into a target instance:
+    - Weaviate → files: filesystem backup API → rsync → <dest>/<backup_id>/
+    - Postgres → files: pg_dump -Fc → rsync → <dest>/database.pgdump
+
+  # Weaviate → local directory (dump, no restore)
+  transfer-data.py root@docker.host localhost \\
+    --copy 'weaviate://weaviate:8080/docker-volume/weaviate_data->directory:/backups/weaviate'
+
+  # Postgres → docker volume on another host (dump, no restore)
+  transfer-data.py root@docker.host root@backup.host \\
+    --copy 'postgres://user:pass@pg-container/mydb->directory:/backups/mydb'
+
 Examples:
   # Docker volume → K8s PVC (rsync daemon, incremental)
   transfer-data.py root@docker.host k8s:orbstack \\
@@ -105,6 +122,17 @@ class Location:
     service_name: Optional[str] = None
     volume_type: Optional[str] = None
     volume_id: Optional[str] = None
+
+    def __repr__(self) -> str:
+        # Mask the password so it never leaks into logs (main() logs Locations
+        # at INFO, and postgres/weaviate URLs may carry credentials).
+        pw = "***" if self.password else None
+        return (
+            f"Location(scheme={self.scheme!r}, host={self.host!r}, path={self.path!r}, "
+            f"username={self.username!r}, password={pw!r}, port={self.port!r}, "
+            f"service_name={self.service_name!r}, volume_type={self.volume_type!r}, "
+            f"volume_id={self.volume_id!r})"
+        )
 
     @classmethod
     def parse(cls, url: str, default_host: Optional[str] = None) -> 'Location':
@@ -260,9 +288,10 @@ class TransferEngine:
     # --- Helpers ---
 
     def _generate_unique_id(self) -> str:
-        return subprocess.run(
-            ['date', '+%s%N'], capture_output=True, text=True
-        ).stdout.strip()[:16]
+        # time.time_ns() is monotonic-enough and portable; the previous
+        # `date +%s%N` yields a literal 'N' on BSD/macOS (no %N support),
+        # which breaks uniqueness of container/backup names when run there.
+        return str(time.time_ns())[:16]
 
     def _parse_malai_id(self, output: str) -> Optional[str]:
         for line in output.splitlines():
@@ -1491,6 +1520,118 @@ exit $COPY_EXIT
 
         print("  ✅ Weaviate backup/restore transfer completed successfully")
 
+    # --- Export to a file-based destination (dump, no restore/import) ---
+
+    def _export_target_with_subpath(self, target: Location, extra: str) -> Location:
+        """Return a copy of a file-based target Location with one path component appended.
+
+        Used to place an export under a named subdirectory (e.g. a Weaviate
+        backup id) inside the user-provided destination. Only a single new
+        directory level should be appended — the rsync client creates just the
+        final destination directory, not missing intermediate parents.
+        """
+        assert target.scheme in ('directory', 'docker-volume', 'k8s-pvc'), \
+            f"Export target must be directory/docker-volume/k8s-pvc, got {target.scheme}"
+        return Location(
+            scheme=target.scheme,
+            host=target.host,
+            path=target.path.rstrip('/') + '/' + extra,
+            username=None,
+            password=None,
+            port=None,
+        )
+
+    def export_weaviate_to_files(
+        self,
+        source: Location,
+        target: Location,
+        exclude: Optional[List[str]] = None,
+    ):
+        """Export a Weaviate instance to a file-based destination.
+
+        Reuses the filesystem backup API + Malai-P2P rsync transport but stops
+        after the files land — there is no restore into a target Weaviate. The
+        result is a native Weaviate filesystem backup at
+        ``<target>/<backup_id>/`` and can be restored later by pointing a fresh
+        Weaviate's BACKUP_FILESYSTEM_PATH at the parent directory and calling the
+        restore API with ``<backup_id>`` (or via transfer_weaviate_backup_restore).
+
+        The destination may be any file-based location the tool supports
+        (directory / docker-volume / k8s-pvc) on any host.
+        """
+        assert source.volume_type in ('docker-volume', 'k8s-pvc'), (
+            "Weaviate export requires a source volume: "
+            "weaviate://host/docker-volume/VOL or weaviate://host/k8s-pvc/NS/PVC"
+        )
+        backup_id = f"export-{self._generate_unique_id()}"
+        print(f"🔄 Exporting Weaviate {source.service_name} → {target.scheme}:{target.path}")
+        print(f"  📋 Backup ID: {backup_id}")
+
+        # Phase 1: Create filesystem backup on source (online, via the API).
+        print("  📦 Phase 1: Creating filesystem backup on source...")
+        with self._weaviate_api_context(source) as src_api:
+            src_api("POST", "/v1/backups/filesystem", {"id": backup_id})
+            self._weaviate_poll_status(src_api, f"/v1/backups/filesystem/{backup_id}")
+        print("  ✅ Backup created on source")
+
+        try:
+            # Phase 2: Pull the backup files to the destination via rsync-p2p.
+            print("  🔄 Phase 2: Transferring backup files to destination (Malai P2P)...")
+            source_loc = self._make_volume_location(source, f"backups/{backup_id}")
+            target_loc = self._export_target_with_subpath(target, backup_id)
+            self.transfer_rsync_daemon(source_loc, target_loc, exclude=exclude)
+            print(f"  ✅ Backup written to {target.path.rstrip('/')}/{backup_id}")
+        finally:
+            # Phase 3: Remove the backup from the source volume (best-effort).
+            print("  🧹 Phase 3: Cleaning up backup on source...")
+            if not self.dry_run:
+                self._cleanup_weaviate_backup(source, backup_id)
+            print("  ✅ Cleanup done")
+
+        print(f"  ✅ Weaviate export complete — restore with backup id '{backup_id}'")
+
+    def export_postgres_to_files(
+        self,
+        source: Location,
+        target: Location,
+        exclude: Optional[List[str]] = None,
+    ):
+        """Export a Postgres database to a file-based destination.
+
+        Reuses pg_dump (custom format) + Malai-P2P rsync transport but stops
+        after the dump lands — there is no restore into a target Postgres. The
+        result is ``<target>/database.pgdump``, restorable with
+        ``pg_restore --no-owner --clean --if-exists -d <db> database.pgdump``.
+
+        The destination may be any file-based location the tool supports
+        (directory / docker-volume / k8s-pvc) on any host.
+        """
+        print(f"🔄 Exporting Postgres {source.host}/{source.path} → {target.scheme}:{target.path}")
+        unique_id = self._generate_unique_id()
+
+        source_volume = None
+        try:
+            source_pg_ns = self._parse_postgres_service(source.service_name)[1] if self.is_k8s_context(source.host) else None
+            source_volume = self._create_temp_volume(source, unique_id, namespace_override=source_pg_ns)
+
+            self._pg_dump_to_volume(source, source_volume, unique_id)
+
+            if self.is_k8s_context(source.host):
+                namespace, pvc_name = source_volume.split('/', 1)
+                source_loc = Location.parse(f"k8s-pvc:/{namespace}/{pvc_name}", source.host)
+            else:
+                source_loc = Location.parse(f"docker-volume:/{source_volume}", source.host)
+
+            print("  🔄 Transferring dump to destination (Malai P2P)...")
+            self.transfer_rsync_daemon(source_loc, target, exclude=exclude)
+            print(f"  ✅ Dump written to {target.path.rstrip('/')}/database.pgdump")
+        finally:
+            if source_volume:
+                self._cleanup_temp_volume(source, source_volume)
+
+        print("  ✅ Postgres export complete — restore with: "
+              "pg_restore --no-owner --clean --if-exists -d <db> database.pgdump")
+
     # --- Rsync daemon (file-based transfers) ---
 
     def _start_rsync_daemon(self, location: Location, unique_id: str) -> dict:
@@ -2032,6 +2173,15 @@ exit $COPY_EXIT
                 self.transfer_weaviate_backup_restore(source, target, exclude)
             else:
                 self.transfer_weaviate_to_weaviate(source, target, exclude)
+            return
+
+        # Export (dump, no restore): datastore source → file-based destination.
+        FILE_SCHEMES = ('directory', 'docker-volume', 'k8s-pvc')
+        if source.scheme == 'weaviate' and target.scheme in FILE_SCHEMES:
+            self.export_weaviate_to_files(source, target, exclude)
+            return
+        if source.scheme == 'postgres' and target.scheme in FILE_SCHEMES:
+            self.export_postgres_to_files(source, target, exclude)
             return
 
         specialized_handlers = {
